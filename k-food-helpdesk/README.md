@@ -67,7 +67,7 @@ Once all services are running:
     "session_id": "optional-session-id"
   }
   ```
-- `POST /search` - Search for relevant documents
+- `POST /search` - Search for relevant documents //for testing RAG 
   ```json
   {
     "message": "delivery areas",
