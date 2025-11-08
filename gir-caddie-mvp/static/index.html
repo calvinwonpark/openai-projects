@@ -1,0 +1,523 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GIR Caddie – Model-Driven MVP</title>
+<style>
+  body { font-family: system-ui, -apple-system, Arial, sans-serif; background:#0b1020; color:#e6e9f2; }
+  .wrap { max-width: 980px; margin: 24px auto; padding: 16px; }
+  .card { background:#121733; border:1px solid #1e2754; border-radius:12px; padding:16px; margin-bottom:16px; }
+  input, button, textarea, select { padding:8px; border-radius:8px; border:1px solid #2b3675; background:#0e1430; color:#e6e9f2; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; }
+  .row > * { flex: 1 1 280px; }
+  pre { white-space: pre-wrap; }
+  .club-item, .bias-item { background:#0a0f26; border:1px solid #1a2344; border-radius:8px; padding:12px; margin-bottom:8px; }
+  .club-item .row, .bias-item .row { margin-bottom: 8px; }
+  .club-item .row:last-child, .bias-item .row:last-child { margin-bottom: 0; }
+  .remove-btn { background:#4a1a2a; border-color:#6a2a3a; color:#ff6b6b; padding: 6px 12px; font-size: 12px; }
+  .remove-btn:hover { background:#5a2a3a; }
+  label { display: block; margin-bottom: 4px; font-size: 14px; }
+  .club-item input, .bias-item input { width: 100%; }
+  .hazard-item { background:#0a0f26; border:1px solid #1a2344; border-radius:8px; padding:12px; margin-bottom:8px; }
+  .scorecard-table { width: 100%; border-collapse: collapse; margin-top: 16px; }
+  .scorecard-table th { background:#1a2344; padding: 10px; text-align: left; border: 1px solid #2b3675; font-weight: 600; }
+  .scorecard-table td { padding: 8px 10px; border: 1px solid #2b3675; }
+  .scorecard-table tr:nth-child(even) { background:#0e1430; }
+  .scorecard-table tr:hover { background:#121733; }
+  .scorecard-header { margin-bottom: 16px; padding: 12px; background:#0a0f26; border-radius:8px; border:1px solid #1a2344; }
+  .scorecard-header h4 { margin: 0 0 8px 0; color: #e6e9f2; }
+  .scorecard-header p { margin: 4px 0; color: #a0a5b8; }
+  .tee-badge { display: inline-block; padding: 4px 8px; margin: 2px; background:#2b3675; border-radius:4px; font-size: 12px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>GIR Caddie – Model-Driven MVP</h1>
+
+  <div class="card">
+    <h3>1) Player Profile (yardages & dispersion)</h3>
+    
+    <div style="margin-bottom: 16px;">
+      <label style="display: block; margin-bottom: 4px;">Player ID:</label>
+      <input type="text" id="playerId" value="calvin" style="width: 100%; max-width: 300px;" />
+    </div>
+
+    <div style="margin-bottom: 16px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <label style="font-weight: 600;">Clubs:</label>
+        <button type="button" id="addClub" style="padding: 6px 12px; font-size: 14px;">+ Add Club</button>
+      </div>
+      <div id="clubsContainer"></div>
+    </div>
+
+    <div style="margin-bottom: 16px;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px;">
+        <label style="font-weight: 600;">Miss Bias (optional):</label>
+        <button type="button" id="addMissBias" style="padding: 6px 12px; font-size: 14px;">+ Add Bias</button>
+      </div>
+      <div id="missBiasContainer"></div>
+    </div>
+
+    <button id="saveProfile" style="padding: 10px 20px; font-size: 16px; margin-top: 16px;">Save Profile</button>
+    <pre id="profileOut" style="margin-top: 16px;"></pre>
+  </div>
+
+  <div class="card">
+    <h3>2) Scorecard → JSON</h3>
+    <input type="file" id="scorecard" accept="image/*" />
+    <button id="parseScorecard">Parse Scorecard</button>
+    <div id="scorecardOut"></div>
+  </div>
+
+  <div class="card">
+    <h3>3) Hole Layout → Hazards JSON</h3>
+    <p style="color: #a0a5b8; font-size: 14px; margin-bottom: 12px;">
+      Upload a single hole image OR a full course map. If using a course map, make sure to enter the correct hole number below.
+    </p>
+    <div class="row">
+      <div><label style="display: block; margin-bottom: 4px;">Hole Number:</label><input id="holeNum" type="number" value="1" placeholder="Hole #" min="1" max="18" /></div>
+      <div><label style="display: block; margin-bottom: 4px;">Tee Box:</label><select id="teeBoxSelect" style="width: 100%;"><option value="">Select Tee (from scorecard)</option></select></div>
+      <div><label style="display: block; margin-bottom: 4px;">Tee Yardage:</label><input id="teeYardage" type="number" value="410" placeholder="Tee yardage for selected tee" /></div>
+    </div>
+    <label style="display: block; margin-top: 12px; margin-bottom: 4px;">Hole Layout Image:</label>
+    <input type="file" id="holeImg" accept="image/*" />
+    <button id="extractLayout">Extract Layout</button>
+    <div id="hazardsContainer" style="margin-top: 16px; display: none;">
+      <h4 style="margin-bottom: 12px;">Hazards (edit directions if needed):</h4>
+      <div id="hazardsList"></div>
+      <button id="recalibrateLayout" style="margin-top: 12px; padding: 10px 20px; font-size: 16px;">Recalibrate with Corrections</button>
+    </div>
+    <pre id="layoutOut" style="margin-top: 16px;"></pre>
+  </div>
+
+  <div class="card">
+    <h3>4) Plan Hole (Model chooses clubs)</h3>
+    <div class="row">
+      <div><input id="holeNumPlan" type="number" value="1" placeholder="Hole #" /></div>
+      <div><input id="teeBox" placeholder="Tee box (e.g., Blue)" value="Blue" /></div>
+    </div>
+    <button id="planHole">Plan Hole</button>
+    <pre id="planOut"></pre>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+
+// Club management
+let clubs = [
+  {club: "Driver", carry: 255, std_lr: 15, std_long: 10, std_short: 10},
+  {club: "3W", carry: 235, std_lr: 12, std_long: 8, std_short: 8},
+  {club: "5W", carry: 220, std_lr: 11, std_long: 8, std_short: 8},
+  {club: "4i", carry: 185, std_lr: 10, std_long: 7, std_short: 7},
+  {club: "7i", carry: 155, std_lr: 8, std_long: 6, std_short: 6},
+  {club: "PW", carry: 120, std_lr: 6, std_long: 5, std_short: 5}
+];
+
+let missBias = [
+  {key: "driver", value: "slight left"},
+  {key: "irons", value: "slight short"}
+];
+
+function renderClubs() {
+  const container = $('clubsContainer');
+  container.innerHTML = '';
+  clubs.forEach((club, idx) => {
+    const div = document.createElement('div');
+    div.className = 'club-item';
+    div.innerHTML = `
+      <div class="row">
+        <div><label>Club:</label><input type="text" data-club-idx="${idx}" data-field="club" value="${club.club || ''}" placeholder="e.g., Driver, 3W, 7i" /></div>
+        <div><label>Carry (yards):</label><input type="number" data-club-idx="${idx}" data-field="carry" value="${club.carry || ''}" placeholder="255" /></div>
+      </div>
+      <div class="row">
+        <div><label>Std Left/Right:</label><input type="number" data-club-idx="${idx}" data-field="std_lr" value="${club.std_lr || ''}" placeholder="15" step="0.1" /></div>
+        <div><label>Std Long:</label><input type="number" data-club-idx="${idx}" data-field="std_long" value="${club.std_long || ''}" placeholder="10" step="0.1" /></div>
+        <div><label>Std Short:</label><input type="number" data-club-idx="${idx}" data-field="std_short" value="${club.std_short || ''}" placeholder="10" step="0.1" /></div>
+      </div>
+      <button type="button" class="remove-btn" onclick="removeClub(${idx})">Remove</button>
+    `;
+    container.appendChild(div);
+    
+    // Add event listeners for input changes
+    div.querySelectorAll('input').forEach(input => {
+      input.oninput = (e) => {
+        const idx = parseInt(e.target.dataset.clubIdx);
+        const field = e.target.dataset.field;
+        const value = e.target.type === 'number' ? parseFloat(e.target.value) || 0 : e.target.value;
+        clubs[idx][field] = value;
+      };
+    });
+  });
+}
+
+function renderMissBias() {
+  const container = $('missBiasContainer');
+  container.innerHTML = '';
+  if (missBias.length === 0) {
+    container.innerHTML = '<div style="color: #888; font-style: italic; padding: 8px;">No miss bias entries</div>';
+    return;
+  }
+  missBias.forEach((bias, idx) => {
+    const div = document.createElement('div');
+    div.className = 'bias-item';
+    div.innerHTML = `
+      <div class="row">
+        <div><label>Key:</label><input type="text" data-bias-idx="${idx}" data-field="key" value="${bias.key || ''}" placeholder="e.g., driver, irons" /></div>
+        <div><label>Value:</label><input type="text" data-bias-idx="${idx}" data-field="value" value="${bias.value || ''}" placeholder="e.g., slight left" /></div>
+        <div style="display: flex; align-items: flex-end;"><button type="button" class="remove-btn" onclick="removeMissBias(${idx})">Remove</button></div>
+      </div>
+    `;
+    container.appendChild(div);
+    
+    // Add event listeners for input changes
+    div.querySelectorAll('input').forEach(input => {
+      input.oninput = (e) => {
+        const idx = parseInt(e.target.dataset.biasIdx);
+        const field = e.target.dataset.field;
+        missBias[idx][field] = e.target.value;
+      };
+    });
+  });
+}
+
+function addClub() {
+  clubs.push({club: "", carry: 0, std_lr: 0, std_long: 0, std_short: 0});
+  renderClubs();
+}
+
+function removeClub(idx) {
+  clubs.splice(idx, 1);
+  renderClubs();
+}
+
+function addMissBias() {
+  missBias.push({key: "", value: ""});
+  renderMissBias();
+}
+
+function removeMissBias(idx) {
+  missBias.splice(idx, 1);
+  renderMissBias();
+}
+
+// Make functions globally accessible for onclick handlers
+window.removeClub = removeClub;
+window.removeMissBias = removeMissBias;
+
+// Initialize
+renderClubs();
+renderMissBias();
+
+$('addClub').onclick = addClub;
+$('addMissBias').onclick = addMissBias;
+
+// 1) Save profile
+$('saveProfile').onclick = async () => {
+  const missBiasObj = {};
+  missBias.forEach(b => {
+    if (b.key && b.value) missBiasObj[b.key] = b.value;
+  });
+  
+  const data = {
+    player_id: $('playerId').value || "user",
+    clubs: clubs.filter(c => c.club), // Only include clubs with a name
+    miss_bias: Object.keys(missBiasObj).length > 0 ? missBiasObj : null
+  };
+  
+  const r = await fetch('/api/profile', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(data) });
+  $('profileOut').textContent = JSON.stringify(await r.json(), null, 2);
+};
+
+// Helper function to render scorecard prettily
+function renderScorecard(data) {
+  if (!data || !data.data) {
+    $('scorecardOut').innerHTML = '<pre style="color: #ff6b6b;">Error: Invalid scorecard data</pre>';
+    return;
+  }
+  
+  const scorecard = data.data;
+  const course = scorecard.course || 'Unknown Course';
+  const tees = scorecard.tees || [];
+  const holes = scorecard.holes || [];
+  
+  let html = '<div class="scorecard-header">';
+  html += `<h4>${course}</h4>`;
+  if (tees.length > 0) {
+    html += '<p><strong>Tees:</strong> ';
+    html += tees.map(tee => `<span class="tee-badge">${tee}</span>`).join('');
+    html += '</p>';
+  }
+  html += '</div>';
+  
+  if (holes.length === 0) {
+    html += '<p style="color: #888;">No hole data available</p>';
+    $('scorecardOut').innerHTML = html;
+    return;
+  }
+  
+  html += '<table class="scorecard-table">';
+  html += '<thead><tr>';
+  html += '<th>Hole</th>';
+  html += '<th>Par</th>';
+  tees.forEach(tee => {
+    html += `<th>${tee}</th>`;
+  });
+  html += '</tr></thead>';
+  html += '<tbody>';
+  
+  let totalPar = 0;
+  const totalsByTee = {};
+  tees.forEach(tee => { totalsByTee[tee] = 0; });
+  
+  holes.forEach(hole => {
+    totalPar += hole.par || 0;
+    html += '<tr>';
+    html += `<td><strong>${hole.num || ''}</strong></td>`;
+    html += `<td>${hole.par || '-'}</td>`;
+    
+    tees.forEach(tee => {
+      const yardage = hole.yardages && hole.yardages[tee];
+      if (yardage !== null && yardage !== undefined) {
+        html += `<td>${yardage}</td>`;
+        totalsByTee[tee] += yardage;
+      } else {
+        html += '<td style="color: #666;">-</td>';
+      }
+    });
+    
+    html += '</tr>';
+  });
+  
+  // Totals row
+  html += '<tr style="background:#1a2344; font-weight: 600;">';
+  html += '<td><strong>Total</strong></td>';
+  html += `<td><strong>${totalPar}</strong></td>`;
+  tees.forEach(tee => {
+    html += `<td><strong>${totalsByTee[tee] || '-'}</strong></td>`;
+  });
+  html += '</tr>';
+  
+  html += '</tbody></table>';
+  
+  $('scorecardOut').innerHTML = html;
+}
+
+// Function to populate tee box dropdown from scorecard data
+function populateTeeBoxDropdown() {
+  const select = $('teeBoxSelect');
+  select.innerHTML = '<option value="">Select Tee (from scorecard)</option>';
+  
+  if (!scorecardData || !scorecardData.tees || scorecardData.tees.length === 0) {
+    return;
+  }
+  
+  scorecardData.tees.forEach(tee => {
+    const option = document.createElement('option');
+    option.value = tee;
+    option.textContent = tee;
+    select.appendChild(option);
+  });
+}
+
+// Function to update tee yardage based on selected tee box and hole number
+function updateTeeYardage() {
+  const holeNum = parseInt($('holeNum').value, 10);
+  const teeBox = $('teeBoxSelect').value;
+  
+  if (!scorecardData || !holeNum || !teeBox) {
+    return;
+  }
+  
+  const hole = scorecardData.holes.find(h => h.num === holeNum);
+  if (hole && hole.yardages && hole.yardages[teeBox] !== null && hole.yardages[teeBox] !== undefined) {
+    $('teeYardage').value = hole.yardages[teeBox];
+  }
+}
+
+// 2) Scorecard -> JSON
+$('parseScorecard').onclick = async () => {
+  const f = $('scorecard').files?.[0];
+  if (!f) { alert('Upload a scorecard image'); return; }
+  const fd = new FormData();
+  fd.append('scorecard_image', f);
+  const r = await fetch('/api/parse-scorecard', { method:'POST', body: fd });
+  const result = await r.json();
+  
+  // Store scorecard data
+  if (result.data) {
+    scorecardData = result.data;
+    populateTeeBoxDropdown();
+  }
+  
+  renderScorecard(result);
+};
+
+// Store scorecard data for tee box selection
+let scorecardData = null;
+
+// Store file data for recalibration
+let currentHoleImageFile = null;
+let currentLayoutData = null;
+
+// Initialize event listeners for tee box and hole number (auto-update yardage)
+// Wait for DOM to be ready
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', setupTeeBoxListeners);
+} else {
+  setupTeeBoxListeners();
+}
+
+function setupTeeBoxListeners() {
+  // Auto-update yardage when tee box or hole number changes
+  $('teeBoxSelect').addEventListener('change', updateTeeYardage);
+  $('holeNum').addEventListener('input', updateTeeYardage);
+  $('holeNum').addEventListener('change', updateTeeYardage);
+}
+
+// Helper function to extract direction from note
+function extractDirection(note) {
+  if (!note) return '';
+  const lowerNote = note.toLowerCase();
+  if (lowerNote.includes('left')) return 'left';
+  if (lowerNote.includes('right')) return 'right';
+  if (lowerNote.includes('center') || lowerNote.includes('middle')) return 'center';
+  return '';
+}
+
+// Helper function to render hazards with editable directions
+function renderHazards(hazards) {
+  const container = $('hazardsList');
+  container.innerHTML = '';
+  
+  hazards.forEach((hazard, idx) => {
+    const direction = extractDirection(hazard.note || '');
+    const div = document.createElement('div');
+    div.className = 'hazard-item';
+    div.style.cssText = 'background:#0a0f26; border:1px solid #1a2344; border-radius:8px; padding:12px; margin-bottom:8px;';
+    div.innerHTML = `
+      <div style="display: flex; gap: 12px; align-items: center; flex-wrap: wrap;">
+        <div style="flex: 1; min-width: 200px;">
+          <strong>${hazard.type}</strong> at ${hazard.yardage_to_hazard} yards
+          ${hazard.note ? `<br><small style="color: #888;">${hazard.note}</small>` : ''}
+        </div>
+        <div style="flex: 0 0 auto;">
+          <label style="display: block; margin-bottom: 4px; font-size: 14px;">Direction:</label>
+          <select data-hazard-idx="${idx}" style="padding: 6px 12px; min-width: 120px;">
+            <option value="">-- Select --</option>
+            <option value="left" ${direction === 'left' ? 'selected' : ''}>Left</option>
+            <option value="right" ${direction === 'right' ? 'selected' : ''}>Right</option>
+            <option value="center" ${direction === 'center' ? 'selected' : ''}>Center</option>
+          </select>
+        </div>
+      </div>
+    `;
+    container.appendChild(div);
+  });
+  
+  $('hazardsContainer').style.display = 'block';
+}
+
+// 3) Layout -> Hazards JSON
+$('extractLayout').onclick = async () => {
+  const f = $('holeImg').files?.[0];
+  if (!f) { alert('Upload a hole layout image'); return; }
+  
+  // Store file for recalibration
+  currentHoleImageFile = f;
+  
+  const fd = new FormData();
+  fd.append('hole_image', f);
+  fd.append('hole_num', $('holeNum').value);
+  fd.append('tee_yardage', $('teeYardage').value);
+  const r = await fetch('/api/extract-hole-layout', { method:'POST', body: fd });
+  const result = await r.json();
+  
+  if (result.data) {
+    currentLayoutData = result.data;
+    $('layoutOut').textContent = JSON.stringify(result, null, 2);
+    
+    // Render hazards with editable directions
+    if (result.data.hazards && result.data.hazards.length > 0) {
+      renderHazards(result.data.hazards);
+    }
+  } else {
+    $('layoutOut').textContent = JSON.stringify(result, null, 2);
+    $('hazardsContainer').style.display = 'none';
+  }
+};
+
+// Recalibrate with corrections
+$('recalibrateLayout').onclick = async () => {
+  if (!currentHoleImageFile) {
+    alert('Please extract layout first');
+    return;
+  }
+  
+  if (!currentLayoutData || !currentLayoutData.hazards) {
+    alert('No hazards data available');
+    return;
+  }
+  
+  // Collect hazard corrections
+  const corrections = [];
+  const selects = document.querySelectorAll('#hazardsList select[data-hazard-idx]');
+  
+  selects.forEach(select => {
+    const idx = parseInt(select.dataset.hazardIdx);
+    const hazard = currentLayoutData.hazards[idx];
+    const direction = select.value;
+    
+    if (direction) {
+      corrections.push({
+        type: hazard.type,
+        yardage_to_hazard: hazard.yardage_to_hazard,
+        direction: direction
+      });
+    }
+  });
+  
+  if (corrections.length === 0) {
+    alert('Please select directions for at least one hazard');
+    return;
+  }
+  
+  const fd = new FormData();
+  fd.append('hole_image', currentHoleImageFile);
+  fd.append('hole_num', $('holeNum').value);
+  fd.append('tee_yardage', $('teeYardage').value);
+  fd.append('hazard_corrections', JSON.stringify(corrections));
+  
+  const r = await fetch('/api/recalibrate-hole-layout', { method:'POST', body: fd });
+  const result = await r.json();
+  
+  if (result.data) {
+    currentLayoutData = result.data;
+    $('layoutOut').textContent = JSON.stringify(result, null, 2);
+    
+    // Re-render hazards with updated data
+    if (result.data.hazards && result.data.hazards.length > 0) {
+      renderHazards(result.data.hazards);
+    }
+  } else {
+    $('layoutOut').textContent = JSON.stringify(result, null, 2);
+  }
+};
+
+// 4) Plan Hole
+$('planHole').onclick = async () => {
+  const body = {
+    hole_num: parseInt($('holeNumPlan').value,10),
+    tee_box: $('teeBox').value.trim()
+  };
+  const r = await fetch('/api/plan-hole', {
+    method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body: JSON.stringify(body)
+  });
+  $('planOut').textContent = JSON.stringify(await r.json(), null, 2);
+};
+</script>
+</body>
+</html>

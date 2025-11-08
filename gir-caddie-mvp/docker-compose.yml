@@ -1,0 +1,17 @@
+services:
+  web:
+    build: .
+    container_name: gir_caddie_web
+    env_file:
+      - .env
+    ports:
+      - "8011:8011"
+    volumes:
+      - ./uploads:/app/uploads
+      - ./static:/app/static
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8011/ || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
