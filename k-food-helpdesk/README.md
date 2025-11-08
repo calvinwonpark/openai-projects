@@ -60,6 +60,7 @@ Once all services are running:
 ### API Endpoints
 
 - `GET /health` - Health check endpoint
+
 - `POST /chat` - Chat with the AI assistant
   ```json
   {
@@ -76,6 +77,25 @@ Once all services are running:
     "session_id": "optional-session-id"
   }
   ```
+
+- `GET /metrics` - Returns performance metrics
+  Returns metrics about API usage and performance:
+  ```json
+  {
+    "total_requests": 42,
+    "total_tokens": 12500,
+    "total_input_tokens": 8000,
+    "total_output_tokens": 4500,
+    "tokens_per_request": 297.62,
+    "p95_latency_seconds": 2.3456,
+    "p95_latency_ms": 2345.6
+  }
+  ```
+  Metrics are tracked automatically for all `/chat` requests and include:
+  - Total request count
+  - Token usage (input, output, and total)
+  - Average tokens per request
+  - 95th percentile latency (in seconds and milliseconds)
 
 ## Project Structure
 
@@ -116,6 +136,7 @@ k-food-helpdesk/
 - **Bilingual Support**: Automatically detects and responds in Korean or English
 - **Semantic Search**: Uses vector embeddings for contextually relevant document retrieval
 - **Session-Aware Caching**: Reuses retrieval results for similar queries (cosine similarity > 0.9) within the same session, reducing API calls and improving response time
+- **Performance Metrics**: Built-in metrics endpoint tracking request counts, token usage, and p95 latency
 - **Source Citation**: Shows which documents were used to generate each response
 - **Restaurant Information**: Includes restaurant data (name, district, categories, hours, delivery areas, allergens)
 - **Policy Documents**: Supports multiple policy documents (refunds, delivery, allergens, account help, hours & fees)
@@ -195,4 +216,19 @@ The system implements intelligent caching to reduce API calls and improve perfor
 - **Session management**: Each browser session gets its own cache that persists until the tab is closed (managed via `sessionStorage`)
 - **Cache limits**: Each session caches up to the last 50 queries to prevent unbounded memory growth
 - **Note**: The cache is in-memory and resets when the server restarts. For production deployments, consider using Redis or a database-backed cache for persistence across restarts
+
+### Performance Metrics
+
+The system automatically tracks performance metrics for monitoring and optimization:
+
+- **Request tracking**: Total number of `/chat` requests processed
+- **Token usage**: Tracks input tokens, output tokens, and calculates average tokens per request
+- **Latency monitoring**: Tracks end-to-end latency for each request and calculates the 95th percentile (p95)
+- **Metrics storage**: Metrics are stored in-memory and reset when the server restarts
+- **Latency window**: P95 calculation uses the last 1000 requests to provide accurate percentile metrics
+
+Access metrics at `GET /metrics` to monitor API usage, token consumption, and response times. This is useful for:
+- Monitoring API costs (token usage)
+- Performance optimization (identifying slow requests via p95 latency)
+- Capacity planning (understanding request patterns)
 
