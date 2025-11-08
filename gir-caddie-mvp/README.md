@@ -142,6 +142,48 @@ The AI will generate:
   ```
   - Returns: Strategic shot plan with club recommendations
 
+- `GET /metrics` - Returns performance metrics
+  Returns metrics about API usage and performance:
+  ```json
+  {
+    "total_requests": 42,
+    "total_tokens": 12500,
+    "total_input_tokens": 8000,
+    "total_output_tokens": 4500,
+    "tokens_per_request": 297.62,
+    "p95_latency_seconds": 2.3456,
+    "p95_latency_ms": 2345.6,
+    "endpoints": {
+      "parse_scorecard": {
+        "requests": 10,
+        "p95_latency_seconds": 3.2,
+        "p95_latency_ms": 3200.0
+      },
+      "extract_layout": {
+        "requests": 15,
+        "p95_latency_seconds": 4.5,
+        "p95_latency_ms": 4500.0
+      },
+      "recalibrate_layout": {
+        "requests": 5,
+        "p95_latency_seconds": 4.8,
+        "p95_latency_ms": 4800.0
+      },
+      "plan_hole": {
+        "requests": 12,
+        "p95_latency_seconds": 2.1,
+        "p95_latency_ms": 2100.0
+      }
+    }
+  }
+  ```
+  Metrics are tracked automatically for all OpenAI API calls and include:
+  - Total request count (across all endpoints)
+  - Token usage (input, output, and total)
+  - Average tokens per request
+  - 95th percentile latency (in seconds and milliseconds) for all requests
+  - Per-endpoint metrics (request counts and p95 latency for each endpoint)
+
 ## Project Structure
 
 ```
@@ -230,6 +272,26 @@ docker compose down -v
    - Hole layout (hazard positions and yardages)
    
    To generate a strategic plan that maximizes GIR probability while avoiding hazards.
+
+## Performance Metrics
+
+The system automatically tracks performance metrics for monitoring and optimization:
+
+- **Request tracking**: Total number of OpenAI API requests processed across all endpoints
+- **Token usage**: Tracks input tokens, output tokens, and calculates average tokens per request
+- **Latency monitoring**: Tracks end-to-end latency for each API call and calculates the 95th percentile (p95)
+- **Per-endpoint metrics**: Tracks request counts and p95 latency for each endpoint:
+  - `parse_scorecard`: Scorecard image parsing
+  - `extract_layout`: Hole layout extraction
+  - `recalibrate_layout`: Layout recalibration with corrections
+  - `plan_hole`: Strategic shot planning
+- **Metrics storage**: Metrics are stored in-memory and reset when the server restarts
+- **Latency window**: P95 calculation uses the last 1000 requests to provide accurate percentile metrics
+
+Access metrics at `GET /metrics` to monitor API usage, token consumption, and response times. This is useful for:
+- Monitoring API costs (token usage for GPT-4o vision and chat calls)
+- Performance optimization (identifying slow requests via p95 latency)
+- Capacity planning (understanding request patterns and usage)
 
 ## Notes
 

@@ -1,4 +1,5 @@
-import os, base64, json
+import os, base64, json, time
+from collections import deque
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, UploadFile
 from fastapi.responses import HTMLResponse, JSONResponse
@@ -14,6 +15,34 @@ ocli = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 app = FastAPI()
 app.mount("/static", StaticFiles(directory="static"), name="static")
+
+# Metrics tracking
+_metrics = {
+    "total_requests": 0,
+    "total_input_tokens": 0,
+    "total_output_tokens": 0,
+    "latencies": deque(maxlen=1000),  # Keep last 1000 latencies for p95 calculation
+    "endpoint_requests": {
+        "parse_scorecard": 0,
+        "extract_layout": 0,
+        "recalibrate_layout": 0,
+        "plan_hole": 0
+    },
+    "endpoint_latencies": {
+        "parse_scorecard": deque(maxlen=1000),
+        "extract_layout": deque(maxlen=1000),
+        "recalibrate_layout": deque(maxlen=1000),
+        "plan_hole": deque(maxlen=1000)
+    }
+}
+
+def _calculate_p95(latencies):
+    """Calculate 95th percentile latency."""
+    if not latencies:
+        return 0.0
+    sorted_latencies = sorted(latencies)
+    index = int(len(sorted_latencies) * 0.95)
+    return sorted_latencies[index] if index < len(sorted_latencies) else sorted_latencies[-1]
 
 @app.get("/", response_class=HTMLResponse)
 def index():
@@ -51,6 +80,7 @@ SCORECARD_SYSTEM = (
 @retry(wait=wait_exponential(min=1, max=15), stop=stop_after_attempt(4))
 def _parse_scorecard_with_openai(image_bytes: bytes) -> dict:
     b64 = _b64(image_bytes)
+    start_time = time.time()
     resp = ocli.chat.completions.create(
         model="gpt-4o",
         response_format={"type":"json_object"},
@@ -63,6 +93,16 @@ def _parse_scorecard_with_openai(image_bytes: bytes) -> dict:
         ],
         temperature=0.0,
     )
+    latency = time.time() - start_time
+    
+    # Track metrics
+    _metrics["total_requests"] += 1
+    _metrics["total_input_tokens"] += resp.usage.prompt_tokens
+    _metrics["total_output_tokens"] += resp.usage.completion_tokens
+    _metrics["latencies"].append(latency)
+    _metrics["endpoint_requests"]["parse_scorecard"] += 1
+    _metrics["endpoint_latencies"]["parse_scorecard"].append(latency)
+    
     return json.loads(resp.choices[0].message.content)
 
 from fastapi import UploadFile
@@ -117,6 +157,7 @@ def _extract_layout_with_openai(image_bytes: bytes, hole_num: int, tee_yardage: 
             corrections_list.append(f"Hazard at {corr.get('yardage_to_hazard', 'unknown')} yards: {corr.get('type', 'unknown')} is on the {corr.get('direction', 'unknown')} side of the fairway.")
         correction_text = "\n\nIMPORTANT CORRECTIONS: " + " ".join(corrections_list) + " Use these corrections to accurately identify hazard positions."
     
+    start_time = time.time()
     resp = ocli.chat.completions.create(
         model="gpt-4o",
         response_format={"type":"json_object"},
@@ -137,10 +178,19 @@ def _extract_layout_with_openai(image_bytes: bytes, hole_num: int, tee_yardage: 
         ],
         temperature=0.2,
     )
+    latency = time.time() - start_time
+    
+    # Track metrics
+    _metrics["total_requests"] += 1
+    _metrics["total_input_tokens"] += resp.usage.prompt_tokens
+    _metrics["total_output_tokens"] += resp.usage.completion_tokens
+    _metrics["latencies"].append(latency)
+    
     return json.loads(resp.choices[0].message.content)
 
 @app.post("/api/extract-hole-layout")
 async def api_extract_layout(req: Request):
+    start_time = time.time()
     form = await req.form()
     file: UploadFile = form.get("hole_image")
     hole_num = int(form.get("hole_num", "1"))
@@ -151,10 +201,14 @@ async def api_extract_layout(req: Request):
     data = _extract_layout_with_openai(img_bytes, hole_num, tee_yardage)
     with open(f"uploads/hole_{hole_num}_layout.json","w",encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    endpoint_latency = time.time() - start_time
+    _metrics["endpoint_requests"]["extract_layout"] += 1
+    _metrics["endpoint_latencies"]["extract_layout"].append(endpoint_latency)
     return {"data": data}
 
 @app.post("/api/recalibrate-hole-layout")
 async def api_recalibrate_layout(req: Request):
+    start_time = time.time()
     form = await req.form()
     file: UploadFile = form.get("hole_image")
     hole_num = int(form.get("hole_num", "1"))
@@ -173,6 +227,9 @@ async def api_recalibrate_layout(req: Request):
     data = _extract_layout_with_openai(img_bytes, hole_num, tee_yardage, hazard_corrections)
     with open(f"uploads/hole_{hole_num}_layout.json","w",encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=2)
+    endpoint_latency = time.time() - start_time
+    _metrics["endpoint_requests"]["recalibrate_layout"] += 1
+    _metrics["endpoint_latencies"]["recalibrate_layout"].append(endpoint_latency)
     return {"data": data}
 
 class HoleSelection(BaseModel):
@@ -208,16 +265,26 @@ def _plan_with_openai(player_json: dict, hole_json: dict, layout_json: dict, hol
                                   f"{json.dumps({'num':hole_num,'par':par,'yardage':tee_yardage,'tee_box':tee_box}, ensure_ascii=False)}"},
         {"role":"user","content": f"Layout & hazards:\n{json.dumps(layout_json, ensure_ascii=False)}"},
     ]
+    start_time = time.time()
     resp = ocli.chat.completions.create(
         model="gpt-4o",
         response_format={"type":"json_object"},
         messages=messages,
         temperature=0.2,
     )
+    latency = time.time() - start_time
+    
+    # Track metrics
+    _metrics["total_requests"] += 1
+    _metrics["total_input_tokens"] += resp.usage.prompt_tokens
+    _metrics["total_output_tokens"] += resp.usage.completion_tokens
+    _metrics["latencies"].append(latency)
+    
     return json.loads(resp.choices[0].message.content)
 
 @app.post("/api/plan-hole")
 async def api_plan_hole(req: Request):
+    start_time = time.time()
     body = await req.json()
     try:
         sel = HoleSelection(**{"hole_num": body.get("hole_num"), "tee_box": body.get("tee_box")})
@@ -232,4 +299,34 @@ async def api_plan_hole(req: Request):
         return JSONResponse({"error":"Missing player/scorecard/layout. Upload those first."}, status_code=400)
 
     plan = _plan_with_openai(player, scorecard, layout, sel.hole_num, sel.tee_box)
+    endpoint_latency = time.time() - start_time
+    _metrics["endpoint_requests"]["plan_hole"] += 1
+    _metrics["endpoint_latencies"]["plan_hole"].append(endpoint_latency)
     return {"plan": plan}
+
+@app.get("/metrics")
+def metrics():
+    """Returns metrics: request counts, token usage, and p95 latency."""
+    p95_latency = _calculate_p95(_metrics["latencies"])
+    total_tokens = _metrics["total_input_tokens"] + _metrics["total_output_tokens"]
+    
+    # Calculate per-endpoint metrics
+    endpoint_metrics = {}
+    for endpoint in _metrics["endpoint_requests"].keys():
+        endpoint_p95 = _calculate_p95(_metrics["endpoint_latencies"][endpoint])
+        endpoint_metrics[endpoint] = {
+            "requests": _metrics["endpoint_requests"][endpoint],
+            "p95_latency_seconds": round(endpoint_p95, 4),
+            "p95_latency_ms": round(endpoint_p95 * 1000, 2)
+        }
+    
+    return {
+        "total_requests": _metrics["total_requests"],
+        "total_tokens": total_tokens,
+        "total_input_tokens": _metrics["total_input_tokens"],
+        "total_output_tokens": _metrics["total_output_tokens"],
+        "tokens_per_request": round(total_tokens / _metrics["total_requests"], 2) if _metrics["total_requests"] > 0 else 0,
+        "p95_latency_seconds": round(p95_latency, 4),
+        "p95_latency_ms": round(p95_latency * 1000, 2),
+        "endpoints": endpoint_metrics
+    }
