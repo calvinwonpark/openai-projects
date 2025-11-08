@@ -1,11 +1,22 @@
 "use client";
-import { useState } from "react";
+import { useState, useEffect } from "react";
 type Msg = { role: "user"|"assistant"; text: string };
 type ChatResp = { answer: string; sources: string[] };
 
 export default function Page() {
   const [input, setInput] = useState("");
   const [history, setHistory] = useState<Msg[]>([]);
+  const [sessionId, setSessionId] = useState<string>("");
+
+  // Generate or retrieve session ID on mount
+  useEffect(() => {
+    let sid = sessionStorage.getItem("session_id");
+    if (!sid) {
+      sid = `session_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
+      sessionStorage.setItem("session_id", sid);
+    }
+    setSessionId(sid);
+  }, []);
 
   async function send() {
     if (!input.trim()) return;
@@ -15,7 +26,7 @@ export default function Page() {
     const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8010";
     const r = await fetch(apiUrl + "/chat", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ message: userMsg })
+      body: JSON.stringify({ message: userMsg, session_id: sessionId })
     });
     const data: ChatResp = await r.json();
     const cited = data.sources?.length ? `\n\nSources: ${data.sources.join(", ")}` : "";

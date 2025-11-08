@@ -29,12 +29,12 @@ def health():
 
 @app.post("/search")
 def search(req: ChatReq):
-    snips = top_k(req.message, 4)
+    snips = top_k(req.message, 4, session_id=req.session_id)
     return {"results": [{"source": s, "content": c} for c, s in snips]}
 
 @app.post("/chat")
 def chat(req: ChatReq):
-    snips = top_k(req.message, 4)
+    snips = top_k(req.message, 4, session_id=req.session_id)
     context = "\n\n".join([f"[{s}]\n{c}" for c, s in snips])
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},

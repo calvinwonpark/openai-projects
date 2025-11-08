@@ -67,7 +67,9 @@ Once all services are running:
     "session_id": "optional-session-id"
   }
   ```
-- `POST /search` - Search for relevant documents //for testing RAG 
+  The frontend automatically generates and sends a `session_id` for caching purposes. If provided, similar queries within the same session will reuse cached retrieval results.
+  
+- `POST /search` - Search for relevant documents (for testing RAG)
   ```json
   {
     "message": "delivery areas",
@@ -113,6 +115,7 @@ k-food-helpdesk/
 
 - **Bilingual Support**: Automatically detects and responds in Korean or English
 - **Semantic Search**: Uses vector embeddings for contextually relevant document retrieval
+- **Session-Aware Caching**: Reuses retrieval results for similar queries (cosine similarity > 0.9) within the same session, reducing API calls and improving response time
 - **Source Citation**: Shows which documents were used to generate each response
 - **Restaurant Information**: Includes restaurant data (name, district, categories, hours, delivery areas, allergens)
 - **Policy Documents**: Supports multiple policy documents (refunds, delivery, allergens, account help, hours & fees)
@@ -181,4 +184,15 @@ When setting up the project:
 - Documents are chunked (800 chars for policies, 600 chars for restaurants) for better retrieval
 - The system uses cosine distance (`<->`) for vector similarity search
 - CORS is configured to allow requests from `localhost:3001` and `localhost:3000`
+
+### Session-Aware Retrieval Caching
+
+The system implements intelligent caching to reduce API calls and improve performance:
+
+- **How it works**: When a user asks a question, the system checks if a similar query (cosine similarity > 0.9) exists in that session's cache
+- **Cache hit**: If a similar query is found, cached retrieval results are returned (skips embedding API call and database query)
+- **Cache miss**: If no similar query exists, the system performs the retrieval and caches the result for future use
+- **Session management**: Each browser session gets its own cache that persists until the tab is closed (managed via `sessionStorage`)
+- **Cache limits**: Each session caches up to the last 50 queries to prevent unbounded memory growth
+- **Note**: The cache is in-memory and resets when the server restarts. For production deployments, consider using Redis or a database-backed cache for persistence across restarts
 
