@@ -1,0 +1,345 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>Metrics - Founder Copilot</title>
+  <style>
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      min-height: 100vh;
+      padding: 20px;
+    }
+
+    .container {
+      max-width: 1200px;
+      margin: 0 auto;
+    }
+
+    .header {
+      background: white;
+      border-radius: 16px;
+      padding: 24px;
+      margin-bottom: 20px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+
+    .header h1 {
+      font-size: 28px;
+      color: #333;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+
+    .header h1::before {
+      content: "📊";
+      font-size: 32px;
+    }
+
+    .reset-btn {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      color: white;
+      border: none;
+      padding: 12px 24px;
+      border-radius: 12px;
+      font-size: 14px;
+      font-weight: 600;
+      cursor: pointer;
+      transition: all 0.2s;
+    }
+
+    .reset-btn:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px rgba(102, 126, 234, 0.4);
+    }
+
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      gap: 20px;
+      margin-bottom: 20px;
+    }
+
+    .stat-card {
+      background: white;
+      border-radius: 16px;
+      padding: 24px;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.1);
+    }
+
+    .stat-card h2 {
+      font-size: 16px;
+      color: #666;
+      margin-bottom: 16px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+    }
+
+    .stat-value {
+      font-size: 36px;
+      font-weight: 700;
+      color: #333;
+      margin-bottom: 8px;
+    }
+
+    .stat-label {
+      font-size: 14px;
+      color: #999;
+    }
+
+    .stat-row {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 12px 0;
+      border-bottom: 1px solid #f0f0f0;
+    }
+
+    .stat-row:last-child {
+      border-bottom: none;
+    }
+
+    .stat-row-label {
+      font-size: 14px;
+      color: #666;
+    }
+
+    .stat-row-value {
+      font-size: 18px;
+      font-weight: 600;
+      color: #333;
+    }
+
+    .highlight {
+      background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .refresh-btn {
+      position: fixed;
+      bottom: 30px;
+      right: 30px;
+      background: white;
+      border: none;
+      width: 56px;
+      height: 56px;
+      border-radius: 50%;
+      box-shadow: 0 4px 12px rgba(0, 0, 0, 0.2);
+      cursor: pointer;
+      font-size: 24px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      transition: all 0.2s;
+    }
+
+    .refresh-btn:hover {
+      transform: rotate(180deg) scale(1.1);
+    }
+
+    .loading {
+      text-align: center;
+      padding: 40px;
+      color: white;
+      font-size: 18px;
+    }
+
+    .error {
+      background: #fee;
+      color: #c33;
+      padding: 16px;
+      border-radius: 8px;
+      margin: 20px 0;
+    }
+
+    @media (max-width: 768px) {
+      .stats-grid {
+        grid-template-columns: 1fr;
+      }
+      
+      .header {
+        flex-direction: column;
+        gap: 16px;
+        align-items: flex-start;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <h1>Metrics Dashboard</h1>
+      <button class="reset-btn" onclick="resetMetrics()">Reset Metrics</button>
+    </div>
+
+    <div id="content">
+      <div class="loading">Loading metrics...</div>
+    </div>
+  </div>
+
+  <button class="refresh-btn" onclick="loadMetrics()" title="Refresh">🔄</button>
+
+<script>
+  async function loadMetrics() {
+    try {
+      const response = await fetch('/api/metrics');
+      const data = await response.json();
+      renderMetrics(data);
+    } catch (error) {
+      document.getElementById('content').innerHTML = `
+        <div class="error">
+          Error loading metrics: ${error.message}
+        </div>
+      `;
+    }
+  }
+
+  function formatNumber(num) {
+    if (num === null || num === undefined) return 'N/A';
+    if (num >= 1000000) return (num / 1000000).toFixed(2) + 'M';
+    if (num >= 1000) return (num / 1000).toFixed(2) + 'K';
+    return num.toLocaleString();
+  }
+
+  function formatMs(ms) {
+    if (ms === null || ms === undefined) return 'N/A';
+    if (ms >= 1000) return (ms / 1000).toFixed(2) + 's';
+    return ms.toFixed(0) + 'ms';
+  }
+
+  function renderMetrics(data) {
+    const content = document.getElementById('content');
+    
+    const successRate = data.request_count > 0 
+      ? ((data.success_count / data.request_count) * 100).toFixed(1) 
+      : '0';
+    
+    content.innerHTML = `
+      <div class="stats-grid">
+        <div class="stat-card">
+          <h2>Requests</h2>
+          <div class="stat-value highlight">${formatNumber(data.request_count)}</div>
+          <div class="stat-label">Total Requests</div>
+          <div style="margin-top: 20px;">
+            <div class="stat-row">
+              <span class="stat-row-label">Successful</span>
+              <span class="stat-row-value" style="color: #22c55e;">${formatNumber(data.success_count)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Errors</span>
+              <span class="stat-row-value" style="color: #ef4444;">${formatNumber(data.error_count)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Success Rate</span>
+              <span class="stat-row-value">${successRate}%</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="stat-card">
+          <h2>Latency (P95)</h2>
+          <div class="stat-value highlight">${formatMs(data.latency.p95)}</div>
+          <div class="stat-label">95th Percentile</div>
+          <div style="margin-top: 20px;">
+            <div class="stat-row">
+              <span class="stat-row-label">P50 (Median)</span>
+              <span class="stat-row-value">${formatMs(data.latency.p50)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">P99</span>
+              <span class="stat-row-value">${formatMs(data.latency.p99)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Average</span>
+              <span class="stat-row-value">${formatMs(data.latency.avg)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Min</span>
+              <span class="stat-row-value">${formatMs(data.latency.min)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Max</span>
+              <span class="stat-row-value">${formatMs(data.latency.max)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Sample Count</span>
+              <span class="stat-row-value">${formatNumber(data.latency.count)}</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="stat-card">
+          <h2>Token Usage</h2>
+          <div class="stat-value highlight">${formatNumber(data.tokens.total)}</div>
+          <div class="stat-label">Total Tokens</div>
+          <div style="margin-top: 20px;">
+            <div class="stat-row">
+              <span class="stat-row-label">Input Tokens</span>
+              <span class="stat-row-value">${formatNumber(data.tokens.total_input)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Output Tokens</span>
+              <span class="stat-row-value">${formatNumber(data.tokens.total_output)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Avg Input/Request</span>
+              <span class="stat-row-value">${formatNumber(data.tokens.avg_input)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Avg Output/Request</span>
+              <span class="stat-row-value">${formatNumber(data.tokens.avg_output)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Avg Total/Request</span>
+              <span class="stat-row-value">${formatNumber(data.tokens.avg_total)}</span>
+            </div>
+            <div class="stat-row">
+              <span class="stat-row-label">Tracked Requests</span>
+              <span class="stat-row-value">${formatNumber(data.tokens.count)}</span>
+            </div>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
+  async function resetMetrics() {
+    if (!confirm('Are you sure you want to reset all metrics? This cannot be undone.')) {
+      return;
+    }
+    
+    try {
+      const response = await fetch('/api/metrics/reset', { method: 'POST' });
+      if (response.ok) {
+        loadMetrics();
+      } else {
+        alert('Error resetting metrics');
+      }
+    } catch (error) {
+      alert('Error resetting metrics: ' + error.message);
+    }
+  }
+
+  // Load metrics on page load
+  loadMetrics();
+
+  // Auto-refresh every 5 seconds
+  setInterval(loadMetrics, 5000);
+</script>
+</body>
+</html>
+
