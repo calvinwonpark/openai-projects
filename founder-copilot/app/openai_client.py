@@ -45,6 +45,7 @@ def upload_files_batch_to_vs(vector_store_id: str, file_paths: list[str]):
 # ---------------- Assistants / Threads (beta) ----------------
 
 def create_assistant(name: str, vector_store_id: str):
+    """Legacy function for single assistant. Use create_specialized_assistant instead."""
     client = get_client()
     return client.beta.assistants.create(
         name=name,
@@ -54,6 +55,36 @@ def create_assistant(name: str, vector_store_id: str):
             {"type": "file_search"},
             {"type": "code_interpreter"}  # For founder analytics and calculations
         ],
+        tool_resources={"file_search": {"vector_store_ids": [vector_store_id]}},
+    )
+
+def create_specialized_assistant(label: str, vector_store_id: str, enable_code_interpreter: bool = False):
+    """
+    Create a specialized assistant for tech, marketing, or investor.
+    
+    Args:
+        label: "tech", "marketing", or "investor"
+        vector_store_id: Vector store ID for this assistant
+        enable_code_interpreter: Whether to enable code_interpreter tool
+    """
+    client = get_client()
+    instructions = _get_specialized_instructions(label)
+    tools = [{"type": "file_search"}]
+    
+    if enable_code_interpreter:
+        tools.append({"type": "code_interpreter"})
+    
+    name_map = {
+        "tech": "TechAdvisor",
+        "marketing": "MarketingAdvisor",
+        "investor": "InvestorAdvisor"
+    }
+    
+    return client.beta.assistants.create(
+        name=name_map.get(label, f"{label.capitalize()}Advisor"),
+        model=get_model(),
+        instructions=instructions,
+        tools=tools,
         tool_resources={"file_search": {"vector_store_ids": [vector_store_id]}},
     )
 
@@ -76,6 +107,78 @@ def _get_assistant_instructions():
         "- Performing statistical analysis "
         "- Modeling scenarios and what-if analyses."
     )
+
+def _get_specialized_instructions(label: str) -> str:
+    """Get specialized instructions for each assistant type."""
+    base = (
+        "IMPORTANT: You MUST use the file_search tool to retrieve information from the knowledge base "
+        "for EVERY user question, even if you think you know the answer. "
+        "Always search the vector store first before responding. "
+        "Use the retrieval tool on the attached vector store to provide concrete, actionable guidance and cite snippets when helpful. "
+        "When possible, produce a JSON object with keys: "
+        "`answer` (string) and `bullets` (array of strings). "
+        "If you cite specifics, reference them inline and expect the system to attach sources. "
+    )
+    
+    if label == "tech":
+        return (
+            base +
+            "You are TechAdvisor, a YC-style technical advisor specializing in: "
+            "- System architecture and scalability "
+            "- AI/ML product patterns and model deployment "
+            "- Infrastructure, databases, APIs, and tech stack decisions "
+            "- Performance optimization and security "
+            "- DevOps, CI/CD, and deployment strategies "
+            "\n\n"
+            "SCOPE ENFORCEMENT: If asked about fundraising, pitch decks, KPIs, or investor relations, "
+            "briefly acknowledge the question and defer: 'This is better handled by InvestorAdvisor. "
+            "For marketing, growth, or launch strategy questions, defer to MarketingAdvisor.' "
+            "Then provide what technical insights you can from your domain. "
+            "\n\n"
+            "For technical calculations or quick computations, you may use code_interpreter if needed."
+        )
+    elif label == "marketing":
+        return (
+            base +
+            "You are MarketingAdvisor, a YC-style marketing and growth advisor specializing in: "
+            "- Launch strategy and go-to-market plans "
+            "- Growth tactics and customer acquisition "
+            "- Copywriting, messaging, and brand positioning "
+            "- Content strategy, SEO, and distribution channels "
+            "- Conversion optimization and funnel design "
+            "\n\n"
+            "SCOPE ENFORCEMENT: If asked about technical architecture, system design, or AI/ML models, "
+            "briefly defer: 'This is better handled by TechAdvisor.' "
+            "If asked about fundraising, pitch decks, KPIs, or investor relations, "
+            "briefly defer: 'This is better handled by InvestorAdvisor.' "
+            "Then provide what marketing insights you can from your domain."
+        )
+    elif label == "investor":
+        return (
+            base +
+            "You are InvestorAdvisor, a YC-style fundraising and investor relations advisor specializing in: "
+            "- Fundraising strategy and investor relations "
+            "- Pitch deck creation and presentation "
+            "- KPIs, financial metrics, and unit economics "
+            "- Valuation, term sheets, and cap table management "
+            "- Financial modeling and projections "
+            "\n\n"
+            "SCOPE ENFORCEMENT: If asked about technical architecture or system design, "
+            "briefly defer: 'This is better handled by TechAdvisor.' "
+            "If asked about marketing, growth, or launch strategy (unless related to investor pitch), "
+            "briefly defer: 'This is better handled by MarketingAdvisor.' "
+            "Then provide what investor/financial insights you can from your domain. "
+            "\n\n"
+            "For financial calculations, data analysis, financial projections, or visualizations, "
+            "use the code_interpreter tool to run Python code. This is especially useful for: "
+            "- Calculating metrics (burn rate, runway, growth rates, CAC, LTV, etc.) "
+            "- Analyzing financial data and projections "
+            "- Creating charts and visualizations "
+            "- Performing statistical analysis "
+            "- Modeling scenarios and what-if analyses."
+        )
+    else:
+        return base
 
 def update_assistant(assistant_id: str, vector_store_id: str):
     """Update an existing assistant with new instructions."""

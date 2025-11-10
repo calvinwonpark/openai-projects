@@ -7,7 +7,8 @@ from typing import List, Optional
 from dotenv import load_dotenv
 
 from app.openai_client import create_thread, add_message, run_assistant_structured, upload_file
-from app.storage import get_ids
+from app.storage import get_ids, get_assistant_ids, get_all_assistant_ids
+from app.router import route_query
 from app.metrics import metrics
 
 import redis.asyncio as redis
@@ -19,7 +20,8 @@ app = FastAPI()
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
-THREADS = {}  # per-session demo (in-memory)
+THREADS = {}  # per-session demo (in-memory) - stores thread_id per session
+THREADS_BY_ASSISTANT = {}  # Stores thread_id per assistant label per session
 
 async def client_ip(req: Request) -> str:
     xff = req.headers.get("x-forwarded-for")
@@ -51,9 +53,25 @@ def health():
 
 @app.post("/reset", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 def reset():
+    """Reset conversation threads (both legacy and multi-assistant)."""
     th = create_thread()
     THREADS["thread_id"] = th.id
-    return {"thread_id": th.id}
+    THREADS_BY_ASSISTANT.clear()  # Clear all assistant-specific threads
+    return {"thread_id": th.id, "message": "All threads reset"}
+
+def _has_grounded_content(result: dict) -> bool:
+    """Check if assistant retrieved grounded content (sources or substantial answer)."""
+    sources = result.get("sources", [])
+    answer = result.get("answer", "").strip()
+    # Consider it grounded if there are sources or a substantial answer (>50 chars)
+    return len(sources) > 0 or len(answer) > 50
+
+def _get_or_create_thread(label: str) -> str:
+    """Get or create a thread for a specific assistant label."""
+    if label not in THREADS_BY_ASSISTANT:
+        th = create_thread()
+        THREADS_BY_ASSISTANT[label] = th.id
+    return THREADS_BY_ASSISTANT[label]
 
 # main costed endpoint: 3 req / 60s per IP
 @app.post("/chat", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
@@ -66,18 +84,68 @@ async def chat(
     if not user_msg:
         return JSONResponse({"error": "message required"}, status_code=400)
 
-    assistant_id, _ = get_ids()
-    if not assistant_id:
-        return JSONResponse({"error": "Seed first: python scripts/seed_knowledge.py"}, status_code=500)
-
-    thread_id = THREADS.get("thread_id")
-    if not thread_id:
-        th = create_thread()
-        thread_id = th.id
-        THREADS["thread_id"] = thread_id
-
+    # Check if multi-assistant setup exists, fallback to legacy single assistant
+    all_assistants = get_all_assistant_ids()
+    if not all_assistants:
+        # Legacy single assistant mode
+        assistant_id, _ = get_ids()
+        if not assistant_id:
+            return JSONResponse({"error": "Seed first: python scripts/seed_multi_assistants.py"}, status_code=500)
+        
+        thread_id = THREADS.get("thread_id")
+        if not thread_id:
+            th = create_thread()
+            thread_id = th.id
+            THREADS["thread_id"] = thread_id
+        
+        try:
+            file_ids = []
+            if files:
+                for file in files:
+                    if file.filename:
+                        file_content = await file.read()
+                        uploaded_file = upload_file(file_content, file.filename)
+                        file_ids.append(uploaded_file.id)
+            
+            add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+            result = run_assistant_structured(thread_id, assistant_id)
+            
+            latency_ms = (time.time() - start_time) * 1000
+            usage = result.get("usage", {})
+            
+            metrics.record_request(
+                latency_ms=latency_ms,
+                input_tokens=usage.get("input_tokens"),
+                output_tokens=usage.get("output_tokens"),
+                total_tokens=usage.get("total_tokens"),
+                error=False
+            )
+            
+            return {
+                "thread_id": thread_id,
+                "answer": result.get("answer", ""),
+                "sources": result.get("sources", []),
+                "raw_text": result.get("raw_text", ""),
+                "bullets": result.get("bullets"),
+                "images": result.get("images", []),
+                "usage": usage
+            }
+        except Exception as e:
+            latency_ms = (time.time() - start_time) * 1000
+            metrics.record_request(latency_ms=latency_ms, error=True)
+            return JSONResponse({"error": str(e)}, status_code=500)
+    
+    # Multi-assistant routing mode
     try:
-        # Upload files if provided
+        # Step 1: Route the query
+        routing = route_query(user_msg)
+        label = routing["label"]
+        confidence = routing["confidence"]
+        top2_label = routing["top2_label"]
+        margin = routing["margin"]
+        is_high_risk = routing["is_high_risk"]
+        
+        # Step 2: Upload files if provided
         file_ids = []
         if files:
             for file in files:
@@ -86,34 +154,148 @@ async def chat(
                     uploaded_file = upload_file(file_content, file.filename)
                     file_ids.append(uploaded_file.id)
         
-        # Add message with file attachments if any
-        add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
-        result = run_assistant_structured(thread_id, assistant_id)
+        # Step 3: Determine routing strategy
+        primary_assistant_id, _ = get_assistant_ids(label)
+        reviewer_assistant_id, _ = get_assistant_ids(top2_label)
+        
+        if not primary_assistant_id:
+            return JSONResponse({"error": f"Assistant '{label}' not found. Run: python scripts/seed_multi_assistants.py"}, status_code=500)
+        
+        primary_result = None
+        reviewer_result = None
+        total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+        
+        # Strategy 1: Winner-take-all (confidence >= 0.8)
+        if confidence >= 0.8:
+            thread_id = _get_or_create_thread(label)
+            add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+            primary_result = run_assistant_structured(thread_id, primary_assistant_id)
+            total_usage = primary_result.get("usage", {})
+        
+        # Strategy 2: Consult-then-decide (0.5 <= confidence < 0.8 OR high-risk)
+        elif (0.5 <= confidence < 0.8) or is_high_risk:
+            if not reviewer_assistant_id:
+                # Fallback to primary only if reviewer not available
+                thread_id = _get_or_create_thread(label)
+                add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+                primary_result = run_assistant_structured(thread_id, primary_assistant_id)
+                total_usage = primary_result.get("usage", {})
+            else:
+                # Run primary first
+                thread_id_primary = _get_or_create_thread(label)
+                add_message(thread_id_primary, "user", user_msg, file_ids=file_ids if file_ids else None)
+                primary_result = run_assistant_structured(thread_id_primary, primary_assistant_id)
+                
+                # Then run reviewer
+                thread_id_reviewer = _get_or_create_thread(top2_label)
+                add_message(thread_id_reviewer, "user", user_msg, file_ids=file_ids if file_ids else None)
+                reviewer_result = run_assistant_structured(thread_id_reviewer, reviewer_assistant_id)
+                
+                # Aggregate usage
+                primary_usage = primary_result.get("usage", {})
+                reviewer_usage = reviewer_result.get("usage", {})
+                total_usage = {
+                    "input_tokens": primary_usage.get("input_tokens", 0) + reviewer_usage.get("input_tokens", 0),
+                    "output_tokens": primary_usage.get("output_tokens", 0) + reviewer_usage.get("output_tokens", 0),
+                    "total_tokens": primary_usage.get("total_tokens", 0) + reviewer_usage.get("total_tokens", 0)
+                }
+        
+        # Strategy 3: Parallel ensemble (confidence < 0.5 OR margin < 0.15)
+        else:
+            if not reviewer_assistant_id:
+                # Fallback to primary only
+                thread_id = _get_or_create_thread(label)
+                add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+                primary_result = run_assistant_structured(thread_id, primary_assistant_id)
+                total_usage = primary_result.get("usage", {})
+            else:
+                # Run both in parallel (sequentially for now, but could be parallelized)
+                thread_id_primary = _get_or_create_thread(label)
+                add_message(thread_id_primary, "user", user_msg, file_ids=file_ids if file_ids else None)
+                primary_result = run_assistant_structured(thread_id_primary, primary_assistant_id)
+                
+                thread_id_reviewer = _get_or_create_thread(top2_label)
+                add_message(thread_id_reviewer, "user", user_msg, file_ids=file_ids if file_ids else None)
+                reviewer_result = run_assistant_structured(thread_id_reviewer, reviewer_assistant_id)
+                
+                # Aggregate usage
+                primary_usage = primary_result.get("usage", {})
+                reviewer_usage = reviewer_result.get("usage", {})
+                total_usage = {
+                    "input_tokens": primary_usage.get("input_tokens", 0) + reviewer_usage.get("input_tokens", 0),
+                    "output_tokens": primary_usage.get("output_tokens", 0) + reviewer_usage.get("output_tokens", 0),
+                    "total_tokens": primary_usage.get("total_tokens", 0) + reviewer_usage.get("total_tokens", 0)
+                }
+        
+        # Step 4: Check if both assistants retrieved nothing (for ensemble cases)
+        if reviewer_result and not _has_grounded_content(primary_result) and not _has_grounded_content(reviewer_result):
+            return {
+                "thread_id": _get_or_create_thread(label),
+                "answer": "I need a bit more context to help you effectively. Could you clarify:\n- What specific aspect are you most interested in?\n- Are you looking for technical guidance, marketing strategy, or investor/fundraising advice?\n- What's your current situation or challenge?",
+                "sources": [],
+                "raw_text": "",
+                "bullets": None,
+                "images": [],
+                "usage": total_usage,
+                "routing": routing
+            }
+        
+        # Step 5: Compose response
+        if reviewer_result:
+            # Combine primary and reviewer responses
+            primary_answer = primary_result.get("answer", "")
+            reviewer_answer = reviewer_result.get("answer", "")
+            
+            # Combine sources
+            all_sources = primary_result.get("sources", []) + reviewer_result.get("sources", [])
+            # Dedupe sources by file_id
+            seen_file_ids = set()
+            unique_sources = []
+            for source in all_sources:
+                file_id = source.get("file_id")
+                if file_id and file_id not in seen_file_ids:
+                    seen_file_ids.add(file_id)
+                    unique_sources.append(source)
+            
+            # Combine images
+            all_images = primary_result.get("images", []) + reviewer_result.get("images", [])
+            
+            # Compose answer
+            composed_answer = f"**{label.capitalize()}Advisor Perspective:**\n{primary_answer}\n\n"
+            composed_answer += f"**{top2_label.capitalize()}Advisor Perspective:**\n{reviewer_answer}"
+            
+            answer = composed_answer
+            sources = unique_sources
+            images = all_images
+            bullets = primary_result.get("bullets")  # Use primary bullets if available
+        else:
+            answer = primary_result.get("answer", "")
+            sources = primary_result.get("sources", [])
+            images = primary_result.get("images", [])
+            bullets = primary_result.get("bullets")
         
         latency_ms = (time.time() - start_time) * 1000
-        
-        # Extract usage from structured response
-        usage = result.get("usage", {})
         
         # Record metrics
         metrics.record_request(
             latency_ms=latency_ms,
-            input_tokens=usage.get("input_tokens"),
-            output_tokens=usage.get("output_tokens"),
-            total_tokens=usage.get("total_tokens"),
+            input_tokens=total_usage.get("input_tokens"),
+            output_tokens=total_usage.get("output_tokens"),
+            total_tokens=total_usage.get("total_tokens"),
             error=False
         )
         
-        # Return structured response with answer, sources, images, and other fields
         return {
-            "thread_id": thread_id,
-            "answer": result.get("answer", ""),
-            "sources": result.get("sources", []),
-            "raw_text": result.get("raw_text", ""),
-            "bullets": result.get("bullets"),  # Optional, if present
-            "images": result.get("images", []),  # Images from code_interpreter
-            "usage": usage
+            "thread_id": _get_or_create_thread(label),
+            "answer": answer,
+            "sources": sources,
+            "raw_text": primary_result.get("raw_text", "") if primary_result else "",
+            "bullets": bullets,
+            "images": images,
+            "usage": total_usage,
+            "routing": routing  # Include routing info for debugging
         }
+        
     except Exception as e:
         latency_ms = (time.time() - start_time) * 1000
         metrics.record_request(latency_ms=latency_ms, error=True)
