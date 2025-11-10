@@ -9,6 +9,7 @@ An AI-powered assistant for startup founders, built with OpenAI's Assistant API.
 - 💬 **Web Interface** - Simple chat UI for interacting with the assistant
 - 🔍 **File Search** - Automatic retrieval of relevant information from knowledge base
 - 📊 **Metrics Dashboard** - Track token usage, latency (P95), and request statistics
+- 🚦 **Rate Limiting** - Redis-based rate limiting to protect API endpoints
 - 🐳 **Docker Support** - Easy deployment with Docker Compose
 
 ## OpenAI API Usage
@@ -161,6 +162,7 @@ Edit `.env` and add your OpenAI API key:
 OPENAI_API_KEY=your_api_key_here
 OPENAI_MODEL=gpt-4.1  # Optional, defaults to gpt-4.1
 COPILOT_NAME=FounderCopilot  # Optional, defaults to FounderCopilot
+REDIS_URL=redis://localhost:6379/0  # Optional, defaults to redis://localhost:6379/0
 ```
 
 ### 2. Install Dependencies
@@ -183,7 +185,24 @@ This will:
 - Create an assistant with access to the vector store
 - Save IDs to `.copilot_state.json`
 
-### 4. Run the Application
+### 4. Start Redis (Required for Rate Limiting)
+
+**With Docker Compose** (recommended):
+Redis is automatically started - no action needed.
+
+**Local Development**:
+```bash
+# macOS
+brew services start redis
+
+# Linux
+sudo systemctl start redis
+
+# Or use Docker
+docker run -d -p 6379:6379 redis:7-alpine
+```
+
+### 5. Run the Application
 
 **Local Development**:
 ```bash
@@ -197,6 +216,8 @@ docker compose up --build
 
 The application will be available at `http://localhost:8000`
 
+**Note**: If Redis is not available, the application will fail to start. Make sure Redis is running before starting the application.
+
 ## Usage
 
 ### Web Interface
@@ -208,17 +229,19 @@ The application will be available at `http://localhost:8000`
 ### API Endpoints
 
 - `GET /` - Web UI
-- `GET /health` - Health check
-- `POST /reset` - Create a new conversation thread
-- `POST /chat` - Send a message to the assistant
+- `GET /health` - Health check (no rate limit)
+- `POST /reset` - Create a new conversation thread (10 requests/minute per IP)
+- `POST /chat` - Send a message to the assistant (3 requests/minute per IP)
   ```json
   {
     "message": "How do I raise pre-seed funding?"
   }
   ```
-- `GET /metrics` - Metrics dashboard (web UI)
-- `GET /api/metrics` - Metrics data (JSON API)
-- `POST /api/metrics/reset` - Reset all metrics
+- `GET /metrics` - Metrics dashboard (web UI, no rate limit)
+- `GET /api/metrics` - Metrics data (JSON API, no rate limit)
+- `POST /api/metrics/reset` - Reset all metrics (no rate limit)
+
+**Note**: Rate limits are enforced per IP address. When rate limits are exceeded, the API returns a `429 Too Many Requests` status code.
 
 ### Adding Knowledge
 
@@ -315,6 +338,77 @@ curl -X POST http://localhost:8000/api/metrics/reset
 4. **In-Memory Storage**: Metrics are stored in memory (resets on server restart)
 5. **Efficient Storage**: Uses deque for latency tracking (configurable max samples, default 1000)
 
+## Rate Limiting
+
+The application uses **FastAPI Limiter with Redis** to enforce rate limits on API endpoints. This protects the service from abuse and helps manage costs.
+
+### Rate Limits
+
+- **`/chat` endpoint**: 3 requests per 60 seconds per IP address
+- **`/reset` endpoint**: 10 requests per 60 seconds per IP address
+- **Other endpoints**: No rate limits applied
+
+### How It Works
+
+1. **Redis-Based**: Rate limiting state is stored in Redis, enabling distributed rate limiting across multiple instances
+2. **IP-Based Identification**: Rate limits are enforced per IP address
+3. **Proxy Support**: Automatically handles `X-Forwarded-For` and `CF-Connecting-IP` headers for accurate IP detection behind proxies
+4. **Automatic Enforcement**: Rate limits are automatically enforced via FastAPI dependencies
+
+### Rate Limit Responses
+
+When a rate limit is exceeded, the API returns:
+
+```json
+{
+  "detail": "Rate limit exceeded: 3 per 60 seconds"
+}
+```
+
+With HTTP status code `429 Too Many Requests`.
+
+### Configuration
+
+Rate limiting requires Redis to be running. The application connects to Redis using the `REDIS_URL` environment variable:
+
+- **Default**: `redis://localhost:6379/0`
+- **Docker**: Automatically configured via `docker-compose.yml`
+
+### Redis Setup
+
+**With Docker Compose** (recommended):
+Redis is automatically started when you run `docker compose up`. No additional configuration needed.
+
+**Local Development**:
+```bash
+# Install and start Redis
+# macOS
+brew install redis
+brew services start redis
+
+# Linux
+sudo apt-get install redis-server
+sudo systemctl start redis
+
+# Or use Docker
+docker run -d -p 6379:6379 redis:7-alpine
+```
+
+### Customizing Rate Limits
+
+To modify rate limits, edit the `RateLimiter` decorators in `app/main.py`:
+
+```python
+# Current: 3 requests per 60 seconds
+@app.post("/chat", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
+
+# Example: 10 requests per minute
+@app.post("/chat", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
+
+# Example: 100 requests per hour
+@app.post("/chat", dependencies=[Depends(RateLimiter(times=100, seconds=3600))])
+```
+
 ## Configuration
 
 ### Environment Variables
@@ -323,6 +417,7 @@ curl -X POST http://localhost:8000/api/metrics/reset
 - `OPENAI_MODEL` (optional) - Model to use, defaults to `gpt-4.1`
 - `COPILOT_NAME` (optional) - Assistant name, defaults to `FounderCopilot`
 - `APP_PORT` (optional) - Server port, defaults to `8000`
+- `REDIS_URL` (optional) - Redis connection URL, defaults to `redis://localhost:6379/0`
 
 ### State Management
 
@@ -334,18 +429,27 @@ The application stores assistant and vector store IDs in `.copilot_state.json`. 
 ## Docker Commands
 
 ```bash
-# Build and start
+# Build and start (includes Redis)
 docker compose up --build
 
 # Run seed script in container
 docker compose exec foundercopilot python scripts/seed_knowledge.py
 
-# View logs
-docker compose logs -f foundercopilot
+# View logs (all services)
+docker compose logs -f
 
-# Stop
+# View logs (specific service)
+docker compose logs -f foundercopilot
+docker compose logs -f redis
+
+# Stop all services
 docker compose down
+
+# Stop and remove volumes
+docker compose down -v
 ```
+
+**Note**: The `docker-compose.yml` includes both the application and Redis services. When you run `docker compose up`, both services start automatically.
 
 ## How It Works
 
@@ -375,6 +479,8 @@ docker compose down
 - `fastapi==0.115.5` - Web framework
 - `uvicorn[standard]==0.32.0` - ASGI server
 - `python-dotenv==1.0.1` - Environment variable management
+- `redis==5.0.6` - Redis client for rate limiting
+- `fastapi-limiter==0.1.6` - Rate limiting for FastAPI
 - `httpx==0.27.2` - HTTP client (dependency)
 - `jinja2==3.1.4` - Template engine (dependency)
 

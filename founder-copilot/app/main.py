@@ -1,6 +1,6 @@
 import os
 import time
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, Depends
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from dotenv import load_dotenv
@@ -9,6 +9,10 @@ from app.openai_client import create_thread, add_message, run_assistant
 from app.storage import get_ids
 from app.metrics import metrics
 
+import redis.asyncio as redis
+from fastapi_limiter import FastAPILimiter
+from fastapi_limiter.depends import RateLimiter
+
 load_dotenv()
 app = FastAPI()
 
@@ -16,17 +20,42 @@ app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
 THREADS = {}  # per-session demo (in-memory)
 
+async def client_ip(req: Request) -> str:
+    xff = req.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    cf = req.headers.get("cf-connecting-ip")
+    if cf:
+        return cf.strip()
+    return req.client.host if req.client else "unknown"
+
+redis_client = None
+
+@app.on_event("startup")
+async def startup():
+    global redis_client
+    redis_client = redis.from_url(os.getenv("REDIS_URL", "redis://localhost:6379/0"),
+                                  encoding="utf-8", decode_responses=True)
+    await FastAPILimiter.init(redis_client, identifier=client_ip)
+
+@app.on_event("shutdown")
+async def shutdown():
+    global redis_client
+    if redis_client:
+        await redis_client.aclose()
+
 @app.get("/health")
 def health():
     return {"ok": True}
 
-@app.post("/reset")
+@app.post("/reset", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 def reset():
     th = create_thread()
     THREADS["thread_id"] = th.id
     return {"thread_id": th.id}
 
-@app.post("/chat")
+# main costed endpoint: 3 req / 60s per IP
+@app.post("/chat", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
 async def chat(req: Request):
     start_time = time.time()
     body = await req.json()
