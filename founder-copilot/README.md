@@ -6,8 +6,9 @@ An AI-powered assistant for startup founders, built with OpenAI's Assistant API.
 
 - 🤖 **AI Assistant** - Powered by GPT-4 with retrieval-augmented generation (RAG)
 - 📚 **Knowledge Base** - Vector store containing startup resources (YC advice, checklists, scenarios)
-- 💬 **Web Interface** - Simple chat UI for interacting with the assistant
+- 💬 **Modern Chat Interface** - Beautiful, responsive web UI with structured responses
 - 🔍 **File Search** - Automatic retrieval of relevant information from knowledge base
+- 📝 **Source Citations** - Automatic extraction and display of source files with quotes
 - 📊 **Metrics Dashboard** - Track token usage, latency (P95), and request statistics
 - 🚦 **Rate Limiting** - Redis-based rate limiting to protect API endpoints
 - 🐳 **Docker Support** - Easy deployment with Docker Compose
@@ -110,12 +111,14 @@ while run.status not in ("completed", "failed"):
 - The tool searches the vector store for semantically similar content
 - Relevant snippets are retrieved and included in the assistant's response
 - The assistant cites sources when referencing knowledge base content
+- Source citations are automatically extracted from message annotations
 
 **Benefits**:
 - Up-to-date information without retraining models
 - Ability to add/update knowledge base files without changing the assistant
 - Automatic relevance ranking and retrieval
 - Citation of sources for transparency
+- Structured output with answer, bullets, and source references
 
 ## Project Structure
 
@@ -135,7 +138,8 @@ founder-copilot/
 │   ├── preseed_checklist.md
 │   └── founder_scenario_b2b.md
 ├── scripts/
-│   └── seed_knowledge.py     # Initialize vector store and assistant
+│   ├── seed_knowledge.py      # Initialize vector store and assistant
+│   └── update_assistant.py    # Update existing assistant instructions
 ├── .env.example
 ├── requirements.txt
 ├── Dockerfile
@@ -182,8 +186,16 @@ python scripts/seed_knowledge.py
 This will:
 - Create a vector store named "founder_copilot_knowledge"
 - Upload all `.md`, `.txt`, and `.json` files from the `data/` directory
-- Create an assistant with access to the vector store
+- Create an assistant with access to the vector store and enforced file_search usage
 - Save IDs to `.copilot_state.json`
+
+**Note**: The assistant is configured to always use the file_search tool for every question, ensuring knowledge base retrieval.
+
+**Updating Assistant Instructions**:
+If you need to update the assistant's instructions without recreating it:
+```bash
+python scripts/update_assistant.py
+```
 
 ### 4. Start Redis (Required for Rate Limiting)
 
@@ -237,6 +249,38 @@ The application will be available at `http://localhost:8000`
     "message": "How do I raise pre-seed funding?"
   }
   ```
+  
+  **Response** (structured format):
+  ```json
+  {
+    "thread_id": "thread_abc123",
+    "answer": "Pre-seed funding typically involves...",
+    "bullets": [
+      "Point 1: ...",
+      "Point 2: ..."
+    ],
+    "sources": [
+      {
+        "file_id": "file_xyz789",
+        "filename": "preseed_checklist.md",
+        "quote": "Relevant quote from the source"
+      }
+    ],
+    "raw_text": "Full response text...",
+    "usage": {
+      "input_tokens": 150,
+      "output_tokens": 200,
+      "total_tokens": 350
+    }
+  }
+  ```
+  
+  **Note**: The response includes structured data with:
+  - `answer`: Main response text (citation markers cleaned)
+  - `bullets`: Array of bullet points (if provided by assistant)
+  - `sources`: Array of source citations with file IDs, filenames, and quotes
+  - `raw_text`: Original response text before processing
+  - `usage`: Token usage statistics
 - `GET /metrics` - Metrics dashboard (web UI, no rate limit)
 - `GET /api/metrics` - Metrics data (JSON API, no rate limit)
 - `POST /api/metrics/reset` - Reset all metrics (no rate limit)
@@ -256,6 +300,8 @@ To add more knowledge to the assistant:
    ```bash
    docker compose exec foundercopilot python scripts/seed_knowledge.py
    ```
+
+**Note**: Re-running the seed script creates a new vector store and assistant. If you want to keep the same assistant ID, you can manually add files to the existing vector store using the OpenAI API, or update the assistant instructions using `update_assistant.py`.
 
 ## Metrics & Monitoring
 
@@ -421,10 +467,15 @@ To modify rate limits, edit the `RateLimiter` decorators in `app/main.py`:
 
 ### State Management
 
-The application stores assistant and vector store IDs in `.copilot_state.json`. This file is:
+The application stores assistant and vector store IDs in a state file:
+- **Local development**: `.copilot_state.json` in the project root
+- **Docker**: `state/copilot_state.json` (persisted via Docker volume)
+
+This file is:
 - Created automatically when you run `seed_knowledge.py`
 - Used by the application to connect to the correct assistant
 - Should be committed to version control (or ignored if you prefer)
+- In Docker, the `state/` directory is mounted as a volume for persistence
 
 ## Docker Commands
 
@@ -434,6 +485,9 @@ docker compose up --build
 
 # Run seed script in container
 docker compose exec foundercopilot python scripts/seed_knowledge.py
+
+# Update assistant instructions (keeps same assistant ID)
+docker compose exec foundercopilot python scripts/update_assistant.py
 
 # View logs (all services)
 docker compose logs -f
@@ -463,15 +517,25 @@ docker compose down -v
 3. **Conversation Flow**:
    - User sends a message via the web UI or API
    - Message is added to a conversation thread
-   - Assistant runs on the thread, automatically using file search when needed
+   - Assistant runs on the thread, automatically using file search for every question
    - Relevant knowledge base snippets are retrieved and included in the response
-   - Response is returned to the user
+   - Source citations are extracted from message annotations
+   - Citation markers are cleaned from the response text
+   - Structured response (answer, bullets, sources) is returned to the user
 
 4. **Retrieval Process**:
    - When the assistant needs information, it uses the file search tool
    - The tool searches the vector store for semantically similar content
    - Top relevant chunks are retrieved and provided as context
    - The assistant synthesizes the information into a helpful response
+   - File citations are automatically added as annotations in the message
+
+5. **Source Extraction**:
+   - Source citations are extracted from message annotations (primary method)
+   - Fallback extraction from run steps if annotations aren't available
+   - File IDs are enriched with filenames by querying the OpenAI Files API
+   - Citation markers (e.g., `【4:0†filename.md】`) are automatically cleaned from text
+   - Sources are displayed in the UI with filenames and quotes
 
 ## Requirements
 

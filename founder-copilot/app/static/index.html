@@ -180,6 +180,95 @@
       font-family: inherit;
     }
 
+    .bullets {
+      margin-top: 12px;
+      padding-left: 20px;
+    }
+
+    .bullets li {
+      margin: 6px 0;
+      line-height: 1.6;
+    }
+
+    .sources {
+      margin-top: 20px;
+      padding-top: 16px;
+      border-top: 2px solid #e8eaf6;
+      background: #f8f9ff;
+      padding: 16px;
+      border-radius: 12px;
+      margin-left: -4px;
+      margin-right: -4px;
+    }
+
+    .sources-title {
+      font-size: 13px;
+      font-weight: 700;
+      color: #667eea;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      margin-bottom: 12px;
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .source-item {
+      background: white;
+      border-left: 4px solid #667eea;
+      padding: 12px 14px;
+      margin: 10px 0;
+      border-radius: 8px;
+      font-size: 13px;
+      box-shadow: 0 1px 3px rgba(0, 0, 0, 0.1);
+      transition: transform 0.2s, box-shadow 0.2s;
+    }
+
+    .source-item:hover {
+      transform: translateX(2px);
+      box-shadow: 0 2px 6px rgba(102, 126, 234, 0.2);
+    }
+
+    .source-filename {
+      font-weight: 700;
+      color: #667eea;
+      margin-bottom: 6px;
+      font-size: 14px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .source-filename::before {
+      content: "📄";
+      font-size: 16px;
+    }
+
+    .source-quote {
+      color: #555;
+      font-style: italic;
+      margin-top: 6px;
+      padding-left: 8px;
+      border-left: 2px solid #e0e0e0;
+      line-height: 1.5;
+    }
+
+    .source-quote:empty {
+      display: none;
+    }
+
+    .citation-badge {
+      display: inline-block;
+      background: #667eea;
+      color: white;
+      font-size: 10px;
+      font-weight: 600;
+      padding: 2px 6px;
+      border-radius: 4px;
+      margin-left: 6px;
+      vertical-align: middle;
+    }
+
     .loading {
       display: flex;
       gap: 4px;
@@ -367,7 +456,7 @@
 
   let threadId = null;
 
-  function addMessage(content, isUser = false, isLoading = false) {
+  function addMessage(content, isUser = false, isLoading = false, structuredData = null) {
     // Remove welcome message if it exists
     const welcomeMsg = chatContainer.querySelector('.welcome-message');
     if (welcomeMsg) {
@@ -391,6 +480,47 @@
         <div class="loading-dot"></div>
         <div class="loading-dot"></div>
       `;
+    } else if (structuredData && !isUser) {
+      // Render structured response
+      let html = '';
+      
+      // Main answer
+      if (structuredData.answer) {
+        // Clean any remaining citation markers and escape HTML
+        let cleanAnswer = structuredData.answer.replace(/【[^】]+】/g, '').trim();
+        const formattedAnswer = escapeHtml(cleanAnswer).replace(/\n/g, '<br>');
+        html += `<div>${formattedAnswer}</div>`;
+      }
+      
+      // Bullets if present
+      if (structuredData.bullets && Array.isArray(structuredData.bullets) && structuredData.bullets.length > 0) {
+        html += '<ul class="bullets">';
+        structuredData.bullets.forEach(bullet => {
+          // Clean citation markers and escape HTML
+          let cleanBullet = bullet.replace(/【[^】]+】/g, '').trim();
+          const formattedBullet = escapeHtml(cleanBullet).replace(/\n/g, '<br>');
+          html += `<li>${formattedBullet}</li>`;
+        });
+        html += '</ul>';
+      }
+      
+      // Sources if present
+      if (structuredData.sources && Array.isArray(structuredData.sources) && structuredData.sources.length > 0) {
+        html += '<div class="sources">';
+        html += `<div class="sources-title">📚 Sources <span class="citation-badge">${structuredData.sources.length}</span></div>`;
+        structuredData.sources.forEach((source, index) => {
+          html += '<div class="source-item">';
+          const displayName = source.filename || source.file_id || 'Unknown Source';
+          html += `<div class="source-filename">${escapeHtml(displayName)}</div>`;
+          if (source.quote && source.quote.trim()) {
+            html += `<div class="source-quote">"${escapeHtml(source.quote)}"</div>`;
+          }
+          html += '</div>';
+        });
+        html += '</div>';
+      }
+      
+      contentDiv.innerHTML = html || content.replace(/\n/g, '<br>');
     } else {
       // Format the content - preserve line breaks
       const formattedContent = content.replace(/\n/g, '<br>');
@@ -405,6 +535,12 @@
     chatContainer.scrollTop = chatContainer.scrollHeight;
     
     return messageDiv;
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement('div');
+    div.textContent = text;
+    return div.innerHTML;
   }
 
   function sendExample(question) {
@@ -439,7 +575,13 @@
       if (data.error) {
         addMessage(`Error: ${data.error}`, false);
       } else {
-        addMessage(data.answer || 'No response received', false);
+        // Use structured data if available, otherwise fallback to answer
+        const structuredData = {
+          answer: data.answer || data.raw_text || 'No response received',
+          bullets: data.bullets,
+          sources: data.sources
+        };
+        addMessage(data.answer || data.raw_text || 'No response received', false, false, structuredData);
         if (data.thread_id) {
           threadId = data.thread_id;
         }

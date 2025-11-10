@@ -5,7 +5,7 @@ from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
 from dotenv import load_dotenv
 
-from app.openai_client import create_thread, add_message, run_assistant
+from app.openai_client import create_thread, add_message, run_assistant_structured
 from app.storage import get_ids
 from app.metrics import metrics
 
@@ -75,29 +75,31 @@ async def chat(req: Request):
 
     try:
         add_message(thread_id, "user", user_msg)
-        m, usage = run_assistant(thread_id, assistant_id)
+        result = run_assistant_structured(thread_id, assistant_id)
         
         latency_ms = (time.time() - start_time) * 1000
         
-        content = ""
-        if m and m.content:
-            # concatenate text parts
-            parts = []
-            for p in m.content:
-                if p.type == "text":
-                    parts.append(p.text.value)
-            content = "\n".join(parts)
+        # Extract usage from structured response
+        usage = result.get("usage", {})
         
         # Record metrics
         metrics.record_request(
             latency_ms=latency_ms,
-            input_tokens=usage.get("input_tokens") if usage else None,
-            output_tokens=usage.get("output_tokens") if usage else None,
-            total_tokens=usage.get("total_tokens") if usage else None,
+            input_tokens=usage.get("input_tokens"),
+            output_tokens=usage.get("output_tokens"),
+            total_tokens=usage.get("total_tokens"),
             error=False
         )
         
-        return {"thread_id": thread_id, "answer": content}
+        # Return structured response with answer, sources, and other fields
+        return {
+            "thread_id": thread_id,
+            "answer": result.get("answer", ""),
+            "sources": result.get("sources", []),
+            "raw_text": result.get("raw_text", ""),
+            "bullets": result.get("bullets"),  # Optional, if present
+            "usage": usage
+        }
     except Exception as e:
         latency_ms = (time.time() - start_time) * 1000
         metrics.record_request(latency_ms=latency_ms, error=True)
