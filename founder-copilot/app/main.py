@@ -291,7 +291,20 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
             if is_consult_then_decide:
                 # Consult-then-decide: Primary answer + critique
                 composed_answer = f"**{label.capitalize()}Advisor Response:**\n{primary_answer}\n\n"
-                composed_answer += f"**{top2_label.capitalize()}Advisor Critique (Devil's Advocate):**\n{reviewer_answer}"
+                
+                # Format reviewer critique (may have structured output with bullets)
+                reviewer_bullets = reviewer_result.get("bullets", [])
+                if reviewer_bullets and isinstance(reviewer_bullets, list):
+                    # If reviewer has bullets, format them nicely
+                    critique_text = reviewer_answer
+                    if reviewer_bullets:
+                        critique_text += "\n\n**Key Points:**\n"
+                        for bullet in reviewer_bullets:
+                            critique_text += f"- {bullet}\n"
+                    composed_answer += f"**{top2_label.capitalize()}Advisor Critique (Devil's Advocate):**\n{critique_text}"
+                else:
+                    # Just use the answer text
+                    composed_answer += f"**{top2_label.capitalize()}Advisor Critique (Devil's Advocate):**\n{reviewer_answer}"
             else:
                 # Parallel ensemble: Both perspectives equally
                 composed_answer = f"**{label.capitalize()}Advisor Perspective:**\n{primary_answer}\n\n"

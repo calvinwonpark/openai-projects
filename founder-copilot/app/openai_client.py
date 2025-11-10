@@ -435,25 +435,69 @@ def _shape_structured_payload(text: str, sources: List[Dict[str, str]]) -> Dict[
     
     # 1) Attempt to parse JSON directly (either whole body or fenced)
     candidate = cleaned_text.strip()
-    # yank JSON between code fences if present
+    parsed = None
+    
+    # Try to extract JSON from code fences first
     if "```" in candidate:
         try:
-            fence = candidate.split("```")
-            # look for the first plausible JSON block
-            for block in fence:
-                b = block.strip()
-                if b.startswith("{") and b.endswith("}"):
-                    candidate = b
-                    break
+            # Split by code fences and look for JSON blocks
+            parts = candidate.split("```")
+            for i, part in enumerate(parts):
+                part = part.strip()
+                # Skip language identifier (json, etc.)
+                if part.lower() in ["json"]:
+                    continue
+                # Try to parse if it looks like JSON
+                if part.startswith("{") and part.endswith("}"):
+                    try:
+                        test_parsed = json.loads(part)
+                        if isinstance(test_parsed, dict) and ("answer" in test_parsed or "bullets" in test_parsed):
+                            parsed = test_parsed
+                            break
+                    except Exception:
+                        continue
         except Exception:
             pass
-
-    parsed = None
-    if candidate.startswith("{") and candidate.endswith("}"):
+    
+    # If no JSON found in code fences, try the whole text or look for JSON object
+    if not parsed:
+        # Try to find JSON object in text (might have text before/after)
+        # Use a balanced bracket approach
         try:
-            parsed = json.loads(candidate)
+            if "{" in candidate:
+                # Find the first { and try to find matching }
+                start_idx = candidate.find("{")
+                if start_idx >= 0:
+                    brace_count = 0
+                    end_idx = start_idx
+                    for i in range(start_idx, len(candidate)):
+                        if candidate[i] == "{":
+                            brace_count += 1
+                        elif candidate[i] == "}":
+                            brace_count -= 1
+                            if brace_count == 0:
+                                end_idx = i
+                                break
+                    
+                    if brace_count == 0:  # Found balanced braces
+                        json_str = candidate[start_idx:end_idx + 1]
+                        try:
+                            test_parsed = json.loads(json_str)
+                            if isinstance(test_parsed, dict) and ("answer" in test_parsed or "bullets" in test_parsed):
+                                parsed = test_parsed
+                        except Exception:
+                            pass
         except Exception:
-            parsed = None
+            pass
+        
+        # Last resort: try parsing the whole candidate if it starts/ends with braces
+        if not parsed and candidate.startswith("{") and candidate.endswith("}"):
+            try:
+                test_parsed = json.loads(candidate)
+                if isinstance(test_parsed, dict) and ("answer" in test_parsed or "bullets" in test_parsed):
+                    parsed = test_parsed
+            except Exception:
+                parsed = None
 
     # 2) If parsed is OK and has "answer", use it; else build our own
     if isinstance(parsed, dict) and ("answer" in parsed or "bullets" in parsed):
