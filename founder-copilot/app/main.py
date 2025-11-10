@@ -186,9 +186,33 @@ async def chat(
                 add_message(thread_id_primary, "user", user_msg, file_ids=file_ids if file_ids else None)
                 primary_result = run_assistant_structured(thread_id_primary, primary_assistant_id)
                 
-                # Then run reviewer
+                # Then ask reviewer to critique (Devil's Advocate pass)
                 thread_id_reviewer = _get_or_create_thread(top2_label)
-                add_message(thread_id_reviewer, "user", user_msg, file_ids=file_ids if file_ids else None)
+                primary_answer = primary_result.get("answer", "")
+                primary_bullets = primary_result.get("bullets", [])
+                
+                # Construct critique prompt
+                critique_prompt = f"""The following is a response from {label.capitalize()}Advisor to the question: "{user_msg}"
+
+**{label.capitalize()}Advisor's Response:**
+{primary_answer}"""
+                
+                if primary_bullets:
+                    critique_prompt += "\n\n**Key Points:**\n"
+                    for bullet in primary_bullets:
+                        critique_prompt += f"- {bullet}\n"
+                
+                critique_prompt += f"""
+
+Please provide a "Devil's Advocate" critique from a {top2_label} perspective. Specifically:
+1. What risks, gaps, or alternative perspectives should be considered?
+2. What might be missing from this analysis?
+3. What additional factors from your domain expertise should be taken into account?
+4. Are there any potential pitfalls or concerns?
+
+Be constructive and specific. Focus on adding value, not just criticizing."""
+                
+                add_message(thread_id_reviewer, "user", critique_prompt, file_ids=file_ids if file_ids else None)
                 reviewer_result = run_assistant_structured(thread_id_reviewer, reviewer_assistant_id)
                 
                 # Aggregate usage
@@ -242,7 +266,10 @@ async def chat(
         
         # Step 5: Compose response
         if reviewer_result:
-            # Combine primary and reviewer responses
+            # Determine if this was consult-then-decide (critique) or parallel ensemble (independent)
+            # Check if reviewer was asked to critique by looking at routing strategy
+            is_consult_then_decide = (0.5 <= confidence < 0.8) or is_high_risk
+            
             primary_answer = primary_result.get("answer", "")
             reviewer_answer = reviewer_result.get("answer", "")
             
@@ -260,9 +287,15 @@ async def chat(
             # Combine images
             all_images = primary_result.get("images", []) + reviewer_result.get("images", [])
             
-            # Compose answer
-            composed_answer = f"**{label.capitalize()}Advisor Perspective:**\n{primary_answer}\n\n"
-            composed_answer += f"**{top2_label.capitalize()}Advisor Perspective:**\n{reviewer_answer}"
+            # Compose answer differently based on strategy
+            if is_consult_then_decide:
+                # Consult-then-decide: Primary answer + critique
+                composed_answer = f"**{label.capitalize()}Advisor Response:**\n{primary_answer}\n\n"
+                composed_answer += f"**{top2_label.capitalize()}Advisor Critique (Devil's Advocate):**\n{reviewer_answer}"
+            else:
+                # Parallel ensemble: Both perspectives equally
+                composed_answer = f"**{label.capitalize()}Advisor Perspective:**\n{primary_answer}\n\n"
+                composed_answer += f"**{top2_label.capitalize()}Advisor Perspective:**\n{reviewer_answer}"
             
             answer = composed_answer
             sources = unique_sources

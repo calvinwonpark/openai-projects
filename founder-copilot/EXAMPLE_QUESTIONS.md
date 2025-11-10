@@ -104,19 +104,21 @@ These questions might trigger parallel ensemble (confidence < 0.5 or margin < 0.
 
 ### Consult-Then-Decide (Moderate Confidence)
 These might trigger consult-then-decide (0.5 ≤ confidence < 0.8):
-- "How do I create a pitch deck for my tech product?" (investor + tech)
-- "What marketing strategy should I use for my SaaS launch?" (marketing + investor)
-- "How do I build a scalable product and market it?" (tech + marketing)
-- "What metrics should I track for my growth strategy?" (investor + marketing)
-- "How do I secure my API and communicate it to investors?" (tech + investor)
+- "How do I create a pitch deck for my tech product?" → InvestorAdvisor answers, TechAdvisor critiques
+- "What marketing strategy should I use for my SaaS launch?" → MarketingAdvisor answers, InvestorAdvisor critiques
+- "How do I build a scalable product and market it?" → TechAdvisor answers, MarketingAdvisor critiques
+- "What metrics should I track for my growth strategy?" → InvestorAdvisor answers, MarketingAdvisor critiques
+- "How do I secure my API and communicate it to investors?" → TechAdvisor answers, InvestorAdvisor critiques
+
+**Note**: In consult-then-decide, the reviewer provides a "Devil's Advocate" critique of the primary response, focusing on risks, gaps, alternative perspectives, and potential pitfalls.
 
 ### High-Risk Questions (Auto Consult-Then-Decide)
 These contain high-risk keywords and will trigger consult-then-decide:
-- "How do I structure my fundraising pitch?"
-- "What should I include in my investor deck?"
-- "How do I value my company for investors?"
-- "What legal considerations are there for fundraising?"
-- "How do I negotiate a term sheet?"
+- "How do I structure my fundraising pitch?" → InvestorAdvisor answers, MarketingAdvisor critiques
+- "What should I include in my investor deck?" → InvestorAdvisor answers, MarketingAdvisor critiques
+- "How do I value my company for investors?" → InvestorAdvisor answers, TechAdvisor critiques
+- "What legal considerations are there for fundraising?" → InvestorAdvisor answers, reviewer critiques
+- "How do I negotiate a term sheet?" → InvestorAdvisor answers, reviewer critiques
 
 ## Questions That Test Scope Enforcement
 
@@ -167,9 +169,11 @@ These contain high-risk keywords and will trigger consult-then-decide:
 
 ### Test Consult-Then-Decide
 - Moderate confidence or high-risk:
-  - "How do I create a pitch deck for my tech startup?" → Investor + Marketing
-  - "What marketing metrics should I track for fundraising?" → Marketing + Investor
-  - "How do I build a secure API for my product?" → Tech + Investor (if security is high-risk)
+  - "How do I create a pitch deck for my tech startup?" → InvestorAdvisor answers, MarketingAdvisor critiques (Devil's Advocate)
+  - "What marketing metrics should I track for fundraising?" → MarketingAdvisor answers, InvestorAdvisor critiques
+  - "How do I build a secure API for my product?" → TechAdvisor answers, InvestorAdvisor critiques (if security is high-risk)
+  
+**Expected Behavior**: Primary assistant answers the question, then reviewer assistant critiques the response with risks, gaps, and alternative perspectives.
 
 ### Test Parallel Ensemble
 - Low confidence or ambiguous:
@@ -201,14 +205,18 @@ These contain high-risk keywords and will trigger consult-then-decide:
 - Routing confidence ≥ 0.8
 
 ### Consult-Then-Decide
-- Two assistants respond
-- Response shows both perspectives
+- Primary assistant answers the question
+- Reviewer assistant critiques the primary response (Devil's Advocate)
+- Response format: "Response" + "Critique (Devil's Advocate)"
 - Routing confidence 0.5-0.8 or high-risk flag
+- Reviewer focuses on: risks, gaps, alternative perspectives, missing factors, potential pitfalls
 
 ### Parallel Ensemble
-- Two assistants respond
-- Combined perspectives
+- Two assistants answer the original question independently
+- Both perspectives presented equally
+- Response format: "Perspective" + "Perspective"
 - Routing confidence < 0.5 or margin < 0.15
+- No critique involved - both are independent answers
 
 ### Clarifying Question
 - System asks for clarification

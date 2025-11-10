@@ -60,9 +60,9 @@ This project has evolved from a simple MVP to a sophisticated multi-assistant sy
 - **Data Isolation**: Separate vector stores per assistant to maintain knowledge base separation
 - **Scope Enforcement**: Assistants defer to others for out-of-scope questions
 - **Routing Strategies**: 
-  - Winner-take-all (high confidence)
-  - Consult-then-decide (moderate confidence or high-risk)
-  - Parallel ensemble (low confidence or ambiguous queries)
+  - Winner-take-all (high confidence): Single assistant responds
+  - Consult-then-decide (moderate confidence or high-risk): Primary answers, reviewer provides Devil's Advocate critique
+  - Parallel ensemble (low confidence or ambiguous queries): Both assistants answer independently, perspectives presented equally
 - **Tool Scoping**: code_interpreter enabled only where needed (Tech and Investor advisors)
 - **Ensemble Responses**: Composed responses from multiple assistants when appropriate
 
@@ -329,7 +329,7 @@ This will:
 - Intelligent routing to the right specialist
 - Data isolation (each assistant has its own knowledge base)
 - Scope enforcement (assistants defer to others for out-of-scope questions)
-- Consult-then-decide for ambiguous or high-risk queries
+- Consult-then-decide for ambiguous or high-risk queries (primary answers, reviewer provides Devil's Advocate critique)
 - Parallel ensemble for low-confidence queries
 
 #### Option B: Single Assistant (Legacy)
@@ -802,8 +802,8 @@ docker compose down -v
    - Router returns: `{label, confidence, top2_label, margin, is_high_risk}`
    - Routing strategies based on confidence and risk:
      - **Winner-take-all** (confidence ≥ 0.8): Single assistant responds
-     - **Consult-then-decide** (0.5 ≤ confidence < 0.8 OR high-risk): Primary + reviewer assistants
-     - **Parallel ensemble** (confidence < 0.5 OR margin < 0.15): Top-2 assistants in parallel
+     - **Consult-then-decide** (0.5 ≤ confidence < 0.8 OR high-risk): Primary assistant answers, then reviewer provides Devil's Advocate critique
+     - **Parallel ensemble** (confidence < 0.5 OR margin < 0.15): Top-2 assistants answer independently, both perspectives presented equally
      - **Clarifying question**: If both assistants retrieve nothing, ask user to clarify
 
 4. **Conversation Flow** (Multi-Assistant):
@@ -811,7 +811,12 @@ docker compose down -v
    - Router classifies query and determines routing strategy
    - Appropriate assistant(s) are selected based on routing logic
    - Each assistant maintains its own conversation thread
-   - For ensemble strategies, responses are composed from multiple assistants
+   - **Winner-take-all**: Single assistant responds
+   - **Consult-then-decide**: Primary assistant answers first, then reviewer assistant critiques the response (Devil's Advocate pass)
+   - **Parallel ensemble**: Both assistants answer the original question independently
+   - Responses are composed differently based on strategy:
+     - Consult-then-decide: "Response" + "Critique (Devil's Advocate)"
+     - Parallel ensemble: "Perspective" + "Perspective" (equal weight)
    - Sources and images from all assistants are aggregated
    - Structured response includes routing information for debugging
 

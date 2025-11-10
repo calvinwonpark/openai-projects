@@ -52,16 +52,19 @@ Based on confidence and risk level, the system uses three routing strategies:
 
 - **When**: Moderate confidence OR query contains high-risk keywords (fundraising, legal, etc.)
 - **Action**: 
-  1. Run primary assistant first
-  2. Run reviewer (top2) assistant
-  3. Compose both perspectives
-- **Use Case**: "How should I structure my pitch deck?" (high-risk, needs investor + marketing input)
+  1. Run primary assistant first (answers the original question)
+  2. Pass primary response to reviewer assistant for critique
+  3. Reviewer provides "Devil's Advocate" critique: risks, gaps, alternative perspectives, missing factors, potential pitfalls
+  4. Compose response: Primary answer + Critique
+- **Use Case**: "How should I structure my pitch deck?" (high-risk, needs investor answer + marketing critique)
+- **Key Difference**: Reviewer sees primary response and critiques it, rather than answering independently
 
 ### 3. Parallel Ensemble (confidence < 0.5 OR margin < 0.15)
 
 - **When**: Low confidence OR labels are very close
-- **Action**: Run both top-2 assistants in parallel, compose perspectives
-- **Use Case**: Ambiguous questions that could benefit from multiple viewpoints
+- **Action**: Run both top-2 assistants in parallel (both answer original question independently), compose perspectives equally
+- **Use Case**: Ambiguous questions that could benefit from multiple independent viewpoints
+- **Key Difference**: Both assistants answer the same question independently, no critique involved
 
 ### 4. Clarifying Question (both assistants retrieve nothing)
 
@@ -170,14 +173,24 @@ Multi-assistant responses include a `routing` field with routing information:
 
 ### Ensemble Responses
 
-When multiple assistants are consulted, the response is composed:
+When multiple assistants are consulted, the response format depends on the strategy:
 
+**Consult-Then-Decide** (Primary + Critique):
 ```
-**InvestorAdvisor Perspective:**
-[Primary assistant's answer]
+**InvestorAdvisor Response:**
+[Primary assistant's answer to the question]
+
+**MarketingAdvisor Critique (Devil's Advocate):**
+[Reviewer's critique: risks, gaps, alternative perspectives, missing factors]
+```
+
+**Parallel Ensemble** (Independent Perspectives):
+```
+**TechAdvisor Perspective:**
+[First assistant's independent answer]
 
 **MarketingAdvisor Perspective:**
-[Reviewer assistant's answer]
+[Second assistant's independent answer]
 ```
 
 ## High-Risk Keywords
@@ -197,6 +210,8 @@ Queries containing these keywords automatically trigger consult-then-decide:
 1. **Specialized Expertise**: Each assistant focuses on its domain
 2. **Data Isolation**: No cross-contamination between knowledge bases
 3. **Intelligent Routing**: Hybrid approach balances speed and accuracy
-4. **Risk Management**: High-risk queries get multiple perspectives
+4. **Risk Management**: High-risk queries get primary answer + critique (Devil's Advocate)
 5. **Flexible Composition**: Can combine insights from multiple assistants
+6. **Critique Mechanism**: Consult-then-decide provides constructive criticism and alternative perspectives
+7. **Independent Perspectives**: Parallel ensemble provides multiple independent viewpoints for ambiguous queries
 
