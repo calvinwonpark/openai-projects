@@ -1,6 +1,9 @@
 import os
 import re
 import json
+import io
+import base64
+import mimetypes
 from openai import OpenAI
 from typing import Dict, Any, List
 
@@ -47,12 +50,15 @@ def create_assistant(name: str, vector_store_id: str):
         name=name,
         model=get_model(),
         instructions=_get_assistant_instructions(),
-        tools=[{"type": "file_search"}],  # retrieval tool in v2 is 'file_search'
+        tools=[
+            {"type": "file_search"},
+            {"type": "code_interpreter"}  # For founder analytics and calculations
+        ],
         tool_resources={"file_search": {"vector_store_ids": [vector_store_id]}},
     )
 
 def _get_assistant_instructions():
-    """Get the assistant instructions that enforce file_search usage."""
+    """Get the assistant instructions that enforce file_search usage and enable code_interpreter for analytics."""
     return (
         "You are a YC-style startup advisor. "
         "IMPORTANT: You MUST use the file_search tool to retrieve information from the knowledge base "
@@ -61,7 +67,14 @@ def _get_assistant_instructions():
         "Use the retrieval tool on the attached vector store to provide concrete, actionable guidance and cite snippets when helpful. "
         "When possible, produce a JSON object with keys: "
         "`answer` (string) and `bullets` (array of strings). "
-        "If you cite specifics, reference them inline and expect the system to attach sources."
+        "If you cite specifics, reference them inline and expect the system to attach sources. "
+        "For founder analytics questions involving calculations, data analysis, financial projections, or visualizations, "
+        "use the code_interpreter tool to run Python code. This is especially useful for: "
+        "- Calculating metrics (burn rate, runway, growth rates, etc.) "
+        "- Analyzing financial data and projections "
+        "- Creating charts and visualizations "
+        "- Performing statistical analysis "
+        "- Modeling scenarios and what-if analyses."
     )
 
 def update_assistant(assistant_id: str, vector_store_id: str):
@@ -70,28 +83,71 @@ def update_assistant(assistant_id: str, vector_store_id: str):
     return client.beta.assistants.update(
         assistant_id=assistant_id,
         instructions=_get_assistant_instructions(),
-        tools=[{"type": "file_search"}],
+        tools=[
+            {"type": "file_search"},
+            {"type": "code_interpreter"}  # For founder analytics and calculations
+        ],
         tool_resources={"file_search": {"vector_store_ids": [vector_store_id]}},
     )
 
 def create_thread():
     return get_client().beta.threads.create()
 
-def add_message(thread_id: str, role: str, content: str):
-    return get_client().beta.threads.messages.create(
-        thread_id=thread_id,
-        role=role,
-        content=content,
+def upload_file(file_content: bytes, filename: str, purpose: str = "assistants"):
+    """
+    Upload a file to OpenAI for use with assistants.
+    Returns the file object with file_id.
+    """
+    client = get_client()
+    # Create a file-like object from bytes
+    file_obj = io.BytesIO(file_content)
+    file_obj.name = filename
+    
+    file = client.files.create(
+        file=file_obj,
+        purpose=purpose
     )
+    return file
+
+def add_message(thread_id: str, role: str, content: str, file_ids: List[str] = None):
+    """
+    Add a message to a thread, optionally with file attachments.
+    
+    Args:
+        thread_id: Thread ID
+        role: "user" or "assistant"
+        content: Message text content
+        file_ids: Optional list of file IDs to attach (for code_interpreter)
+    """
+    client = get_client()
+    
+    # Build message creation parameters
+    message_params = {
+        "thread_id": thread_id,
+        "role": role,
+        "content": content,
+    }
+    
+    # If file_ids are provided, attach them using the attachments parameter
+    # This is the correct way to attach files for code_interpreter
+    if file_ids:
+        message_params["attachments"] = [
+            {"file_id": file_id, "tools": [{"type": "code_interpreter"}]}
+            for file_id in file_ids
+        ]
+    
+    return client.beta.threads.messages.create(**message_params)
 
 def _extract_text_and_citations(message) -> Dict[str, Any]:
     """
     From an Assistant message, return:
     - text: concatenated assistant text
     - citations: list of {file_id, quote}
+    - images: list of {file_id} for image_file content (from code_interpreter)
     """
     text_parts: List[str] = []
     citations: List[Dict[str, str]] = []
+    images: List[Dict[str, str]] = []
 
     # Get message content - try multiple access methods
     content = []
@@ -111,6 +167,25 @@ def _extract_text_and_citations(message) -> Dict[str, Any]:
             part_type = part.type
         elif isinstance(part, dict):
             part_type = part.get("type")
+        
+        # Handle image_file content (from code_interpreter visualizations)
+        if part_type == "image_file":
+            image_file_obj = None
+            if hasattr(part, "image_file"):
+                image_file_obj = part.image_file
+            elif isinstance(part, dict):
+                image_file_obj = part.get("image_file")
+            
+            if image_file_obj:
+                file_id = None
+                if hasattr(image_file_obj, "file_id"):
+                    file_id = image_file_obj.file_id
+                elif isinstance(image_file_obj, dict):
+                    file_id = image_file_obj.get("file_id")
+                
+                if file_id:
+                    images.append({"file_id": file_id})
+            continue
         
         if part_type != "text":
             continue
@@ -209,7 +284,11 @@ def _extract_text_and_citations(message) -> Dict[str, Any]:
                             "quote": quote or ""
                         })
 
-    return {"text": "\n".join(text_parts).strip(), "citations": citations}
+    return {
+        "text": "\n".join(text_parts).strip(),
+        "citations": citations,
+        "images": images
+    }
 
 def _filename_for_file_id(file_id: str) -> str:
     """
@@ -337,10 +416,11 @@ def run_assistant_structured(thread_id: str, assistant_id: str) -> Dict[str, Any
 
     assistant_msg = msgs.data[0]
 
-    # Extract text and annotations from message
+    # Extract text, citations, and images from message
     extracted = _extract_text_and_citations(assistant_msg)
     text = extracted["text"]
     citations = _dedupe_sources(extracted["citations"])
+    images = extracted.get("images", [])
 
     # Fallback: Try to extract file IDs from run steps if no citations found
     file_ids_from_steps = set()
@@ -432,7 +512,41 @@ def run_assistant_structured(thread_id: str, assistant_id: str) -> Dict[str, Any
             "quote": c.get("quote", "")
         })
 
+    # Download images and convert to base64 for display
+    image_data = []
+    for img in images:
+        file_id = img.get("file_id")
+        if file_id:
+            try:
+                # Download the image file from OpenAI
+                file_response = client.files.content(file_id)
+                image_bytes = file_response.read()
+                
+                # Convert to base64 data URL
+                # Try to determine content type from file metadata
+                try:
+                    file_info = client.files.retrieve(file_id)
+                    filename = getattr(file_info, "filename", "image.png")
+                    content_type, _ = mimetypes.guess_type(filename)
+                    if not content_type:
+                        content_type = "image/png"  # Default to PNG
+                except Exception:
+                    content_type = "image/png"
+                
+                base64_data = base64.b64encode(image_bytes).decode("utf-8")
+                data_url = f"data:{content_type};base64,{base64_data}"
+                
+                image_data.append({
+                    "file_id": file_id,
+                    "data_url": data_url
+                })
+            except Exception:
+                # If image download fails, skip it
+                pass
+    
     # Shape final payload
     payload = _shape_structured_payload(text, sources)
     payload["usage"] = usage or {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    if image_data:
+        payload["images"] = image_data
     return payload

@@ -1,11 +1,12 @@
 import os
 import time
-from fastapi import FastAPI, Request, Depends
+from fastapi import FastAPI, Request, Depends, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse
+from typing import List, Optional
 from dotenv import load_dotenv
 
-from app.openai_client import create_thread, add_message, run_assistant_structured
+from app.openai_client import create_thread, add_message, run_assistant_structured, upload_file
 from app.storage import get_ids
 from app.metrics import metrics
 
@@ -56,10 +57,12 @@ def reset():
 
 # main costed endpoint: 3 req / 60s per IP
 @app.post("/chat", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
-async def chat(req: Request):
+async def chat(
+    message: str = Form(...),
+    files: Optional[List[UploadFile]] = File(None)
+):
     start_time = time.time()
-    body = await req.json()
-    user_msg = body.get("message", "").strip()
+    user_msg = message.strip()
     if not user_msg:
         return JSONResponse({"error": "message required"}, status_code=400)
 
@@ -74,7 +77,17 @@ async def chat(req: Request):
         THREADS["thread_id"] = thread_id
 
     try:
-        add_message(thread_id, "user", user_msg)
+        # Upload files if provided
+        file_ids = []
+        if files:
+            for file in files:
+                if file.filename:
+                    file_content = await file.read()
+                    uploaded_file = upload_file(file_content, file.filename)
+                    file_ids.append(uploaded_file.id)
+        
+        # Add message with file attachments if any
+        add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
         result = run_assistant_structured(thread_id, assistant_id)
         
         latency_ms = (time.time() - start_time) * 1000
@@ -91,13 +104,14 @@ async def chat(req: Request):
             error=False
         )
         
-        # Return structured response with answer, sources, and other fields
+        # Return structured response with answer, sources, images, and other fields
         return {
             "thread_id": thread_id,
             "answer": result.get("answer", ""),
             "sources": result.get("sources", []),
             "raw_text": result.get("raw_text", ""),
             "bullets": result.get("bullets"),  # Optional, if present
+            "images": result.get("images", []),  # Images from code_interpreter
             "usage": usage
         }
     except Exception as e:
@@ -116,7 +130,7 @@ def get_metrics():
 
 @app.post("/api/metrics/reset")
 def reset_metrics():
-    """Reset all metrics."""
+    """Reset all metrics."""    
     metrics.reset()
     return {"status": "reset"}
 

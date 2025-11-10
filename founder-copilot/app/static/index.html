@@ -300,8 +300,76 @@
       border-top: 1px solid #e0e0e0;
       background: white;
       display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .input-row {
+      display: flex;
       gap: 12px;
       align-items: center;
+    }
+
+    .file-upload-area {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .file-list {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      max-height: 80px;
+      overflow-y: auto;
+    }
+
+    .file-item {
+      background: #f0f0f0;
+      border: 1px solid #ddd;
+      border-radius: 16px;
+      padding: 6px 12px;
+      font-size: 12px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      color: #555;
+    }
+
+    .file-item .remove-file {
+      cursor: pointer;
+      color: #999;
+      font-weight: bold;
+      padding: 0 4px;
+    }
+
+    .file-item .remove-file:hover {
+      color: #e74c3c;
+    }
+
+    #fileInput {
+      display: none;
+    }
+
+    .file-upload-btn {
+      padding: 10px 16px;
+      background: #f8f9fa;
+      border: 2px dashed #ddd;
+      border-radius: 20px;
+      font-size: 13px;
+      cursor: pointer;
+      transition: all 0.2s;
+      color: #666;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      white-space: nowrap;
+    }
+
+    .file-upload-btn:hover {
+      border-color: #667eea;
+      background: #f0f4ff;
+      color: #667eea;
     }
 
     #msg {
@@ -443,8 +511,15 @@
     </div>
 
     <div class="input-container">
-      <input id="msg" placeholder="Type your question..." autocomplete="off"/>
-      <button id="send">Send</button>
+      <div class="file-upload-area" id="fileUploadArea" style="display: none;">
+        <div class="file-list" id="fileList"></div>
+      </div>
+      <div class="input-row">
+        <input type="file" id="fileInput" multiple accept=".csv,.xlsx,.xls,.json,.txt,.pdf">
+        <label for="fileInput" class="file-upload-btn">📎 Attach File</label>
+        <input id="msg" placeholder="Type your question..." autocomplete="off"/>
+        <button id="send">Send</button>
+      </div>
     </div>
   </div>
 
@@ -453,10 +528,14 @@
   const msgInput = document.getElementById('msg');
   const sendBtn = document.getElementById('send');
   const resetBtn = document.getElementById('reset');
+  const fileInput = document.getElementById('fileInput');
+  const fileList = document.getElementById('fileList');
+  const fileUploadArea = document.getElementById('fileUploadArea');
 
   let threadId = null;
+  let selectedFiles = [];
 
-  function addMessage(content, isUser = false, isLoading = false, structuredData = null) {
+  function addMessage(content, isUser = false, isLoading = false, structuredData = null, attachedFiles = []) {
     // Remove welcome message if it exists
     const welcomeMsg = chatContainer.querySelector('.welcome-message');
     if (welcomeMsg) {
@@ -472,6 +551,16 @@
     
     const contentDiv = document.createElement('div');
     contentDiv.className = 'message-content';
+    
+    // Show attached files for user messages
+    if (isUser && attachedFiles.length > 0) {
+      let filesHtml = '<div style="margin-bottom: 8px; font-size: 12px; color: #666;">';
+      attachedFiles.forEach(file => {
+        filesHtml += `<span style="display: inline-flex; align-items: center; gap: 4px; background: #f0f0f0; padding: 4px 8px; border-radius: 8px; margin-right: 6px;">📎 ${escapeHtml(file.name)}</span>`;
+      });
+      filesHtml += '</div>';
+      contentDiv.innerHTML = filesHtml;
+    }
     
     if (isLoading) {
       contentDiv.className = 'loading';
@@ -504,6 +593,19 @@
         html += '</ul>';
       }
       
+      // Images if present (from code_interpreter visualizations)
+      if (structuredData.images && Array.isArray(structuredData.images) && structuredData.images.length > 0) {
+        html += '<div class="images-container" style="margin: 16px 0;">';
+        structuredData.images.forEach((image, index) => {
+          if (image.data_url) {
+            html += `<div class="chart-image" style="margin-bottom: 12px;">`;
+            html += `<img src="${escapeHtml(image.data_url)}" alt="Chart ${index + 1}" style="max-width: 100%; height: auto; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);" />`;
+            html += `</div>`;
+          }
+        });
+        html += '</div>';
+      }
+      
       // Sources if present
       if (structuredData.sources && Array.isArray(structuredData.sources) && structuredData.sources.length > 0) {
         html += '<div class="sources">';
@@ -523,8 +625,13 @@
       contentDiv.innerHTML = html || content.replace(/\n/g, '<br>');
     } else {
       // Format the content - preserve line breaks
-      const formattedContent = content.replace(/\n/g, '<br>');
-      contentDiv.innerHTML = formattedContent;
+      const formattedContent = escapeHtml(content).replace(/\n/g, '<br>');
+      if (isUser && attachedFiles.length > 0) {
+        // Append text content after files
+        contentDiv.innerHTML += formattedContent;
+      } else {
+        contentDiv.innerHTML = formattedContent;
+      }
     }
     
     messageDiv.appendChild(avatar);
@@ -548,23 +655,70 @@
     sendMessage();
   }
 
+  // File management
+  fileInput.addEventListener('change', (e) => {
+    const files = Array.from(e.target.files);
+    selectedFiles = [...selectedFiles, ...files];
+    updateFileList();
+  });
+
+  function updateFileList() {
+    if (selectedFiles.length === 0) {
+      fileUploadArea.style.display = 'none';
+      fileList.innerHTML = '';
+      return;
+    }
+    
+    fileUploadArea.style.display = 'flex';
+    fileList.innerHTML = '';
+    selectedFiles.forEach((file, index) => {
+      const fileItem = document.createElement('div');
+      fileItem.className = 'file-item';
+      fileItem.innerHTML = `
+        <span>📎 ${escapeHtml(file.name)}</span>
+        <span class="remove-file" onclick="removeFile(${index})">×</span>
+      `;
+      fileList.appendChild(fileItem);
+    });
+  }
+
+  window.removeFile = function(index) {
+    selectedFiles.splice(index, 1);
+    updateFileList();
+    // Update file input
+    const dt = new DataTransfer();
+    selectedFiles.forEach(file => dt.items.add(file));
+    fileInput.files = dt.files;
+  };
+
   async function sendMessage() {
     const msg = msgInput.value.trim();
-    if (!msg) return;
+    if (!msg && selectedFiles.length === 0) return;
 
-    // Add user message
-    addMessage(msg, true);
+    // Add user message with attached files
+    const filesToShow = selectedFiles.map(f => ({ name: f.name }));
+    addMessage(msg || '📎 [File attached]', true, false, null, filesToShow);
+    
+    const filesToSend = [...selectedFiles];
     msgInput.value = '';
+    selectedFiles = [];
+    updateFileList();
     sendBtn.disabled = true;
 
     // Add loading message
     const loadingMsg = addMessage('', false, true);
 
     try {
+      // Create FormData for file upload
+      const formData = new FormData();
+      formData.append('message', msg || 'Please analyze the attached file(s).');
+      filesToSend.forEach(file => {
+        formData.append('files', file);
+      });
+
       const response = await fetch('/chat', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: msg })
+        body: formData
       });
 
       const data = await response.json();
@@ -579,7 +733,8 @@
         const structuredData = {
           answer: data.answer || data.raw_text || 'No response received',
           bullets: data.bullets,
-          sources: data.sources
+          sources: data.sources,
+          images: data.images || []
         };
         addMessage(data.answer || data.raw_text || 'No response received', false, false, structuredData);
         if (data.thread_id) {
@@ -600,6 +755,11 @@
       const response = await fetch('/reset', { method: 'POST' });
       const data = await response.json();
       threadId = data.thread_id;
+      
+      // Clear files
+      selectedFiles = [];
+      updateFileList();
+      fileInput.value = '';
       
       // Clear chat and show welcome message
       chatContainer.innerHTML = `
