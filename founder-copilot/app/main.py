@@ -1,12 +1,13 @@
 import os
 import time
+import json
 from fastapi import FastAPI, Request, Depends, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, FileResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
 from typing import List, Optional
 from dotenv import load_dotenv
 
-from app.openai_client import create_thread, add_message, run_assistant_structured, upload_file
+from app.openai_client import create_thread, add_message, run_assistant_structured, run_assistant_stream, upload_file
 from app.storage import get_ids, get_assistant_ids, get_all_assistant_ids
 from app.router import route_query
 from app.metrics import metrics
@@ -366,3 +367,211 @@ def reset_metrics():
 def metrics_page():
     """Serve the metrics dashboard page."""
     return FileResponse("app/static/metrics.html")
+
+
+@app.post("/chat/stream", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
+async def chat_stream(
+    message: str = Form(...),
+    files: Optional[List[UploadFile]] = File(None)
+):
+    """Streaming chat endpoint using Server-Sent Events."""
+    start_time = time.time()
+    user_msg = message.strip()
+    if not user_msg:
+        return JSONResponse({"error": "message required"}, status_code=400)
+
+    async def stream_response():
+        try:
+            # Check if multi-assistant setup exists
+            all_assistants = get_all_assistant_ids()
+            if not all_assistants:
+                # Legacy single assistant mode
+                assistant_id, _ = get_ids()
+                if not assistant_id:
+                    yield f"data: {json.dumps({'type': 'error', 'error': 'Seed first: python scripts/seed_multi_assistants.py'})}\n\n"
+                    return
+                
+                thread_id = THREADS.get("thread_id")
+                if not thread_id:
+                    th = create_thread()
+                    thread_id = th.id
+                    THREADS["thread_id"] = thread_id
+                
+                # Upload files
+                file_ids = []
+                if files:
+                    for file in files:
+                        if file.filename:
+                            file_content = await file.read()
+                            uploaded_file = upload_file(file_content, file.filename)
+                            file_ids.append(uploaded_file.id)
+                
+                add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+                
+                # Stream response
+                for chunk in run_assistant_stream(thread_id, assistant_id):
+                    chunk["routing"] = {"strategy": "legacy"}
+                    yield f"data: {json.dumps(chunk)}\n\n"
+                
+                # Record metrics
+                latency_ms = (time.time() - start_time) * 1000
+                metrics.record_request(latency_ms=latency_ms, error=False)
+                return
+            
+            # Multi-assistant routing mode
+            routing = route_query(user_msg)
+            label = routing["label"]
+            confidence = routing["confidence"]
+            top2_label = routing["top2_label"]
+            margin = routing["margin"]
+            is_high_risk = routing["is_high_risk"]
+            
+            # Upload files
+            file_ids = []
+            if files:
+                for file in files:
+                    if file.filename:
+                        file_content = await file.read()
+                        uploaded_file = upload_file(file_content, file.filename)
+                        file_ids.append(uploaded_file.id)
+            
+            primary_assistant_id, _ = get_assistant_ids(label)
+            reviewer_assistant_id, _ = get_assistant_ids(top2_label)
+            
+            if not primary_assistant_id:
+                error_msg = f"Assistant '{label}' not found. Run: python scripts/seed_multi_assistants.py"
+                yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
+                return
+            
+            # Strategy 1: Winner-take-all (confidence >= 0.8)
+            if confidence >= 0.8:
+                thread_id = _get_or_create_thread(label)
+                add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+                
+                yield f"data: {json.dumps({'type': 'routing', 'strategy': 'winner_take_all', 'label': label, 'confidence': confidence})}\n\n"
+                
+                # Stream primary response
+                for chunk in run_assistant_stream(thread_id, primary_assistant_id):
+                    chunk["routing"] = routing
+                    yield f"data: {json.dumps(chunk)}\n\n"
+            
+            # Strategy 2: Consult-then-decide (0.5 <= confidence < 0.8 OR high-risk)
+            elif (0.5 <= confidence < 0.8) or is_high_risk:
+                if not reviewer_assistant_id:
+                    # Fallback to primary only
+                    thread_id = _get_or_create_thread(label)
+                    add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+                    
+                    yield f"data: {json.dumps({'type': 'routing', 'strategy': 'winner_take_all', 'label': label, 'confidence': confidence})}\n\n"
+                    
+                    for chunk in run_assistant_stream(thread_id, primary_assistant_id):
+                        chunk["routing"] = routing
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                else:
+                    # Stream primary first
+                    thread_id_primary = _get_or_create_thread(label)
+                    add_message(thread_id_primary, "user", user_msg, file_ids=file_ids if file_ids else None)
+                    
+                    yield f"data: {json.dumps({'type': 'routing', 'strategy': 'consult_then_decide', 'primary_label': label, 'reviewer_label': top2_label, 'confidence': confidence})}\n\n"
+                    
+                    # Stream primary response
+                    primary_answer = ""
+                    primary_bullets = []
+                    for chunk in run_assistant_stream(thread_id_primary, primary_assistant_id):
+                        if chunk.get("type") == "text_delta":
+                            primary_answer = chunk.get("accumulated", "")
+                        elif chunk.get("type") == "done":
+                            primary_answer = chunk.get("answer", "")
+                            primary_bullets = chunk.get("bullets", [])
+                        chunk["routing"] = routing
+                        chunk["phase"] = "primary"
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    
+                    # Signal primary is done, starting reviewer
+                    yield f"data: {json.dumps({'type': 'phase_transition', 'from': 'primary', 'to': 'reviewer'})}\n\n"
+                    
+                    # Then ask reviewer to critique
+                    thread_id_reviewer = _get_or_create_thread(top2_label)
+                    critique_prompt = f"""The following is a response from {label.capitalize()}Advisor to the question: "{user_msg}"
+
+**{label.capitalize()}Advisor's Response:**
+{primary_answer}"""
+                    
+                    if primary_bullets:
+                        critique_prompt += "\n\n**Key Points:**\n"
+                        for bullet in primary_bullets:
+                            critique_prompt += f"- {bullet}\n"
+                    
+                    critique_prompt += f"""
+
+Please provide a "Devil's Advocate" critique from a {top2_label} perspective. Specifically:
+1. What risks, gaps, or alternative perspectives should be considered?
+2. What might be missing from this analysis?
+3. What additional factors from your domain expertise should be taken into account?
+4. Are there any potential pitfalls or concerns?
+
+Be constructive and specific. Focus on adding value, not just criticizing."""
+                    
+                    add_message(thread_id_reviewer, "user", critique_prompt, file_ids=file_ids if file_ids else None)
+                    
+                    # Stream reviewer response
+                    for chunk in run_assistant_stream(thread_id_reviewer, reviewer_assistant_id):
+                        chunk["routing"] = routing
+                        chunk["phase"] = "reviewer"
+                        yield f"data: {json.dumps(chunk)}\n\n"
+            
+            # Strategy 3: Parallel ensemble (confidence < 0.5 OR margin < 0.15)
+            else:
+                if not reviewer_assistant_id:
+                    # Fallback to primary only
+                    thread_id = _get_or_create_thread(label)
+                    add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+                    
+                    yield f"data: {json.dumps({'type': 'routing', 'strategy': 'winner_take_all', 'label': label, 'confidence': confidence})}\n\n"
+                    
+                    for chunk in run_assistant_stream(thread_id, primary_assistant_id):
+                        chunk["routing"] = routing
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                else:
+                    # Stream primary first
+                    thread_id_primary = _get_or_create_thread(label)
+                    add_message(thread_id_primary, "user", user_msg, file_ids=file_ids if file_ids else None)
+                    
+                    yield f"data: {json.dumps({'type': 'routing', 'strategy': 'parallel_ensemble', 'primary_label': label, 'reviewer_label': top2_label, 'confidence': confidence})}\n\n"
+                    
+                    # Stream primary response
+                    for chunk in run_assistant_stream(thread_id_primary, primary_assistant_id):
+                        chunk["routing"] = routing
+                        chunk["phase"] = "primary"
+                        yield f"data: {json.dumps(chunk)}\n\n"
+                    
+                    # Signal primary is done, starting reviewer
+                    yield f"data: {json.dumps({'type': 'phase_transition', 'from': 'primary', 'to': 'reviewer'})}\n\n"
+                    
+                    # Stream reviewer response (independent answer)
+                    thread_id_reviewer = _get_or_create_thread(top2_label)
+                    add_message(thread_id_reviewer, "user", user_msg, file_ids=file_ids if file_ids else None)
+                    
+                    for chunk in run_assistant_stream(thread_id_reviewer, reviewer_assistant_id):
+                        chunk["routing"] = routing
+                        chunk["phase"] = "reviewer"
+                        yield f"data: {json.dumps(chunk)}\n\n"
+            
+            # Record metrics
+            latency_ms = (time.time() - start_time) * 1000
+            metrics.record_request(latency_ms=latency_ms, error=False)
+            
+        except Exception as e:
+            latency_ms = (time.time() - start_time) * 1000
+            metrics.record_request(latency_ms=latency_ms, error=True)
+            yield f"data: {json.dumps({'type': 'error', 'error': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        stream_response(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"  # Disable nginx buffering
+        }
+    )

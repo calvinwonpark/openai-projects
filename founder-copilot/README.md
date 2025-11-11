@@ -8,6 +8,7 @@ An AI-powered assistant for startup founders, built with OpenAI's Assistant API.
 - 🎯 **Multi-Assistant Routing** - Intelligent routing to specialized assistants (Tech, Marketing, Investor)
 - 📚 **Knowledge Base** - Vector store containing startup resources (YC advice, checklists, scenarios)
 - 💬 **Modern Chat Interface** - Beautiful, responsive web UI with structured responses
+- ⚡ **Real-Time Streaming** - Server-Sent Events (SSE) for live response streaming with visual indicators
 - 🔍 **File Search** - Automatic retrieval of relevant information from knowledge base
 - 📝 **Source Citations** - Automatic extraction and display of source files with quotes
 - 🧮 **Code Interpreter** - Python code execution for founder analytics, calculations, and visualizations
@@ -54,7 +55,7 @@ This project has evolved from a simple MVP to a sophisticated multi-assistant sy
 - **Image Extraction**: Download and convert images from code_interpreter to base64 data URLs
 - **Financial Analytics**: Calculate burn rate, runway, KPIs, and create visualizations
 
-### Phase 6: Multi-Assistant Routing (Current)
+### Phase 6: Multi-Assistant Routing
 - **Specialized Assistants**: Three domain-specific assistants (TechAdvisor, MarketingAdvisor, InvestorAdvisor)
 - **Intelligent Routing**: Hybrid heuristic + classifier approach for query routing
 - **Data Isolation**: Separate vector stores per assistant to maintain knowledge base separation
@@ -66,6 +67,15 @@ This project has evolved from a simple MVP to a sophisticated multi-assistant sy
 - **Tool Scoping**: code_interpreter enabled only where needed (Tech and Investor advisors)
 - **Ensemble Responses**: Composed responses from multiple assistants when appropriate
 
+### Phase 7: Real-Time Streaming (Current)
+- **Streaming API**: Server-Sent Events (SSE) for live response streaming
+- **Real-Time Updates**: Text streams in character-by-character as the assistant generates it
+- **Streaming Indicator**: Animated dots (". . .") show when stream is active vs complete
+- **JSON Extraction**: Automatic extraction of answer from JSON responses during streaming
+- **Phase-Aware Streaming**: Separate tracking of primary and reviewer responses in multi-assistant mode
+- **Live Formatting**: Markdown formatting applied in real-time as text streams
+- **Progressive Display**: Primary response streams immediately, reviewer comments append when ready
+
 ### Key Milestones
 1. ✅ **MVP Launch**: Basic assistant with knowledge base
 2. ✅ **Rate Limiting**: Production-ready API protection
@@ -74,6 +84,7 @@ This project has evolved from a simple MVP to a sophisticated multi-assistant sy
 5. ✅ **Code Interpreter**: Financial analytics and visualizations
 6. ✅ **File Upload**: CSV/Excel analysis capabilities
 7. ✅ **Multi-Assistant System**: Intelligent routing to specialized assistants
+8. ✅ **Real-Time Streaming**: Live response streaming with visual indicators
 
 ## OpenAI API Usage
 
@@ -400,7 +411,8 @@ The application will be available at `http://localhost:8000`
 - `GET /` - Web UI
 - `GET /health` - Health check (no rate limit)
 - `POST /reset` - Create a new conversation thread (10 requests/minute per IP)
-- `POST /chat` - Send a message to the assistant (3 requests/minute per IP)
+- `POST /chat` - Send a message to the assistant (3 requests/minute per IP) - **Legacy non-streaming endpoint**
+- `POST /chat/stream` - Send a message with real-time streaming (3 requests/minute per IP) - **Recommended**
   ```json
   {
     "message": "How do I raise pre-seed funding?"
@@ -453,6 +465,52 @@ The application will be available at `http://localhost:8000`
   - `raw_text`: Original response text before processing
   - `usage`: Token usage statistics
   - `routing`: (Multi-assistant mode only) Routing information including label, confidence, top2_label, margin, and is_high_risk
+
+- `POST /chat/stream` - **Streaming chat endpoint** (Server-Sent Events)
+  
+  **Request** (multipart/form-data):
+  ```bash
+  curl -X POST http://localhost:8000/chat/stream \
+    -F "message=What tools should I use for deployment?" \
+    -F "files=@kpi_tracker.csv"
+  ```
+  
+  **Response** (Server-Sent Events stream):
+  ```
+  data: {"type":"routing","strategy":"consult_then_decide","primary_label":"tech","reviewer_label":"marketing","confidence":0.65}
+  
+  data: {"type":"text_delta","content":"For","accumulated":"For"}
+  
+  data: {"type":"text_delta","content":" zero","accumulated":"For zero"}
+  
+  data: {"type":"text_delta","content":"-downtime","accumulated":"For zero-downtime"}
+  
+  data: {"type":"sources","sources":[{"file_id":"file_xyz","filename":"deployment.md","quote":"..."}]}
+  
+  data: {"type":"phase_transition","from":"primary","to":"reviewer"}
+  
+  data: {"type":"text_delta","content":"Here","phase":"reviewer","accumulated":"Here"}
+  
+  data: {"type":"done","answer":"...","bullets":[...],"sources":[...],"images":[...],"usage":{...},"phase":"reviewer"}
+  ```
+  
+  **Stream Event Types**:
+  - `routing`: Routing decision (strategy, labels, confidence)
+  - `text_delta`: Incremental text updates (`content` = new chunk, `accumulated` = full text so far)
+  - `sources`: Source citations update
+  - `images`: Image/chart updates
+  - `phase_transition`: Transition between primary and reviewer phases (multi-assistant mode)
+  - `done`: Stream complete with final structured data
+  - `error`: Error occurred during streaming
+  
+  **Features**:
+  - **Real-time streaming**: Text appears as it's generated
+  - **Streaming indicator**: Animated dots (". . .") show active streaming
+  - **JSON extraction**: Automatically extracts answer from JSON responses during streaming
+  - **Phase-aware**: Tracks primary and reviewer responses separately in multi-assistant mode
+  - **Progressive display**: Primary response streams first, reviewer comments append when ready
+  - **Live formatting**: Markdown formatting applied in real-time
+  - **Citation cleaning**: Citation markers removed during streaming
 - `GET /metrics` - Metrics dashboard (web UI, no rate limit)
 - `GET /api/metrics` - Metrics data (JSON API, no rate limit)
 - `POST /api/metrics/reset` - Reset all metrics (no rate limit)
@@ -750,7 +808,14 @@ docker compose down -v
    - User sends a message via the web UI or API (optionally with file attachments)
    - If files are attached, they are uploaded to OpenAI and attached to the message
    - Message is added to a conversation thread
-   - Assistant runs on the thread, automatically using file search for every question
+   - **Streaming mode** (recommended): Assistant response streams in real-time via Server-Sent Events
+     - Text appears character-by-character as it's generated
+     - Streaming indicator (animated dots) shows active streaming
+     - JSON responses are automatically parsed and extracted during streaming
+     - Markdown formatting applied in real-time
+     - Citation markers cleaned during streaming
+   - **Non-streaming mode** (legacy): Assistant runs to completion, then returns full response
+   - Assistant automatically uses file search for every question
    - For analytics questions, the assistant uses code_interpreter to run Python code
    - Relevant knowledge base snippets are retrieved and included in the response
    - Calculations, charts, and visualizations are generated when needed
@@ -807,18 +872,24 @@ docker compose down -v
      - **Clarifying question**: If both assistants retrieve nothing, ask user to clarify
 
 4. **Conversation Flow** (Multi-Assistant):
-   - User sends a message via web UI or API
+   - User sends a message via web UI or API (streaming or non-streaming)
    - Router classifies query and determines routing strategy
    - Appropriate assistant(s) are selected based on routing logic
    - Each assistant maintains its own conversation thread
-   - **Winner-take-all**: Single assistant responds
-   - **Consult-then-decide**: Primary assistant answers first, then reviewer assistant critiques the response (Devil's Advocate pass)
+   - **Winner-take-all**: Single assistant responds (streams immediately)
+   - **Consult-then-decide**: 
+     - Primary assistant answers first (streams immediately)
+     - Reviewer assistant critiques the response (Devil's Advocate pass)
+     - Reviewer response streams and appends to primary (doesn't overwrite)
    - **Parallel ensemble**: Both assistants answer the original question independently
+     - Primary response streams first
+     - Reviewer response streams and appends when ready
    - Responses are composed differently based on strategy:
      - Consult-then-decide: "Response" + "Critique (Devil's Advocate)"
      - Parallel ensemble: "Perspective" + "Perspective" (equal weight)
    - Sources and images from all assistants are aggregated
    - Structured response includes routing information for debugging
+   - **Streaming mode**: All responses stream in real-time with visual indicators
 
 5. **Scope Enforcement**:
    - Each assistant has instructions to defer to others for out-of-scope questions

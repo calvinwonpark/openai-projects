@@ -5,7 +5,7 @@ import io
 import base64
 import mimetypes
 from openai import OpenAI
-from typing import Dict, Any, List
+from typing import Dict, Any, List, Generator, Optional
 
 _client = None
 
@@ -425,6 +425,126 @@ def _clean_citation_markers(text: str) -> str:
     cleaned = re.sub(pattern, '', text)
     return cleaned.strip()
 
+def _extract_answer_from_incomplete_json(text: str) -> Optional[str]:
+    """
+    Try to extract the answer field from JSON, even if the JSON is incomplete.
+    This is useful during streaming when JSON might not be fully formed yet.
+    """
+    if not text:
+        return None
+    
+    cleaned = _clean_citation_markers(text)
+    trimmed = cleaned.strip()
+    
+    # If it doesn't look like JSON, return None
+    if not (trimmed.startswith('{') or '"answer"' in trimmed or "'answer'" in trimmed):
+        return None
+    
+    # Try to find "answer" field and extract its value
+    # Look for "answer": "value" pattern
+    # Handle both complete and incomplete JSON
+    
+    # Approach 1: Try to find complete JSON object
+    try:
+        # Find the first { and try to match braces
+        start_idx = trimmed.find('{')
+        if start_idx >= 0:
+            brace_count = 0
+            end_idx = start_idx
+            for i in range(start_idx, len(trimmed)):
+                if trimmed[i] == '{':
+                    brace_count += 1
+                elif trimmed[i] == '}':
+                    brace_count -= 1
+                    if brace_count == 0:
+                        end_idx = i
+                        break
+            
+            if brace_count == 0:  # Found balanced braces
+                json_str = trimmed[start_idx:end_idx + 1]
+                try:
+                    parsed = json.loads(json_str)
+                    if isinstance(parsed, dict) and "answer" in parsed:
+                        answer = parsed.get("answer")
+                        if answer and isinstance(answer, str):
+                            return answer
+                except Exception:
+                    pass
+    except Exception:
+        pass
+    
+    # Approach 2: Extract answer using manual parsing (for incomplete JSON)
+    # Find "answer": and then extract the string value, handling escaped characters
+    try:
+        # Find the position of "answer":
+        answer_key_pos = trimmed.find('"answer"')
+        if answer_key_pos == -1:
+            answer_key_pos = trimmed.find("'answer'")
+            quote_char = "'"
+        else:
+            quote_char = '"'
+        
+        if answer_key_pos >= 0:
+            # Find the colon after "answer"
+            colon_pos = trimmed.find(':', answer_key_pos)
+            if colon_pos >= 0:
+                # Find the opening quote of the value
+                value_start = trimmed.find(quote_char, colon_pos + 1)
+                if value_start >= 0:
+                    value_start += 1  # Skip the opening quote
+                    # Now find the closing quote, accounting for escaped quotes
+                    value_end = None
+                    i = value_start
+                    while i < len(trimmed):
+                        if trimmed[i] == '\\':
+                            # Skip escaped character
+                            i += 2
+                            continue
+                        elif trimmed[i] == quote_char:
+                            value_end = i
+                            break
+                        i += 1
+                    
+                    if value_end is not None and value_end > value_start:
+                        # Found complete value (with closing quote)
+                        answer_value = trimmed[value_start:value_end]
+                    elif value_start < len(trimmed):
+                        # Incomplete value (no closing quote yet) - use everything from value_start to end
+                        answer_value = trimmed[value_start:]
+                    else:
+                        answer_value = None
+                    
+                    if answer_value:
+                        # Unescape the string
+                        answer_value = answer_value.replace('\\"', '"').replace("\\'", "'")
+                        answer_value = answer_value.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+                        answer_value = answer_value.replace('\\\\', '\\')
+                        if answer_value.strip():  # Only return if we got a non-empty value
+                            return answer_value
+    except Exception:
+        pass
+    
+    # Approach 3: Fallback to regex (for edge cases)
+    patterns = [
+        r'"answer"\s*:\s*"((?:[^"\\]|\\.)*?)"(?:\s*[,}])',
+        r"'answer'\s*:\s*'((?:[^'\\]|\\.)*?)'(?:\s*[,}])",
+        r'"answer"\s*:\s*"((?:[^"\\]|\\.)*)"',
+        r"'answer'\s*:\s*'((?:[^'\\]|\\.)*)'",
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, trimmed, re.DOTALL)
+        if match:
+            answer_value = match.group(1)
+            # Unescape the string
+            answer_value = answer_value.replace('\\"', '"').replace("\\'", "'")
+            answer_value = answer_value.replace('\\n', '\n').replace('\\t', '\t').replace('\\r', '\r')
+            answer_value = answer_value.replace('\\\\', '\\')
+            if answer_value:
+                return answer_value
+    
+    return None
+
 def _shape_structured_payload(text: str, sources: List[Dict[str, str]]) -> Dict[str, Any]:
     """
     Try to parse a JSON object if the model returned one.
@@ -697,3 +817,189 @@ def run_assistant_structured(thread_id: str, assistant_id: str) -> Dict[str, Any
     if image_data:
         payload["images"] = image_data
     return payload
+
+def run_assistant_stream(thread_id: str, assistant_id: str) -> Generator[Dict[str, Any], None, None]:
+    """
+    Stream assistant responses as they are generated.
+    Yields chunks with structure: {type, content, delta, ...}
+    Types: 'text_delta', 'sources', 'images', 'done', 'error'
+    """
+    client = get_client()
+    
+    # Create a streaming run
+    try:
+        with client.beta.threads.runs.stream(
+            thread_id=thread_id,
+            assistant_id=assistant_id,
+        ) as stream:
+            accumulated_text = ""
+            citations = []
+            images = []
+            usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            
+            for event in stream:
+                # Handle text deltas
+                if event.event == "thread.message.delta":
+                    if hasattr(event, "data") and hasattr(event.data, "delta"):
+                        delta = event.data.delta
+                        if hasattr(delta, "content") and delta.content is not None:
+                            for content_item in delta.content:
+                                if hasattr(content_item, "type"):
+                                    if content_item.type == "text":
+                                        if hasattr(content_item, "text") and hasattr(content_item.text, "value"):
+                                            text_delta = content_item.text.value
+                                            accumulated_text += text_delta
+                                            # Clean citation markers from delta
+                                            cleaned_delta = _clean_citation_markers(text_delta)
+                                            cleaned_accumulated = _clean_citation_markers(accumulated_text)
+                                            
+                                            # Try to extract answer from JSON if present (handles incomplete JSON during streaming)
+                                            display_text = cleaned_accumulated
+                                            extracted_answer = _extract_answer_from_incomplete_json(cleaned_accumulated)
+                                            if extracted_answer:
+                                                display_text = extracted_answer
+                                            
+                                            yield {
+                                                "type": "text_delta",
+                                                "content": cleaned_delta,
+                                                "accumulated": display_text  # Use extracted answer if JSON was parsed
+                                            }
+                                    elif content_item.type == "image_file":
+                                        if hasattr(content_item, "image_file") and hasattr(content_item.image_file, "file_id"):
+                                            file_id = content_item.image_file.file_id
+                                            images.append({"file_id": file_id})
+                
+                # Handle annotations (citations) - these come in the same delta event
+                if event.event == "thread.message.delta" and hasattr(event, "data"):
+                    if hasattr(event.data, "delta") and hasattr(event.data.delta, "content"):
+                        delta_content = event.data.delta.content
+                        if delta_content is not None:
+                            for content_item in delta_content:
+                                if hasattr(content_item, "type") and content_item.type == "text":
+                                    if hasattr(content_item, "text") and hasattr(content_item.text, "annotations"):
+                                        annotations = content_item.text.annotations
+                                        if annotations is not None:
+                                            for ann in annotations:
+                                                if hasattr(ann, "type") and ann.type == "file_citation":
+                                                    if hasattr(ann, "file_citation") and hasattr(ann.file_citation, "file_id"):
+                                                        file_id = ann.file_citation.file_id
+                                                        quote = getattr(ann.file_citation, "quote", "") or ""
+                                                        citations.append({
+                                                            "file_id": file_id,
+                                                            "quote": quote
+                                                        })
+                                                        # Yield source update
+                                                        sources = []
+                                                        for c in _dedupe_sources(citations):
+                                                            sources.append({
+                                                                "file_id": c["file_id"],
+                                                                "filename": _filename_for_file_id(c["file_id"]),
+                                                                "quote": c.get("quote", "")
+                                                            })
+                                                        yield {
+                                                            "type": "sources",
+                                                            "sources": sources
+                                                        }
+                
+                # Handle completion
+                if event.event == "thread.run.completed":
+                    # Get final message and extract any remaining data
+                    try:
+                        msgs = client.beta.threads.messages.list(thread_id=thread_id, order="desc", limit=1)
+                        if msgs.data and msgs.data[0].role == "assistant":
+                            assistant_msg = msgs.data[0]
+                            extracted = _extract_text_and_citations(assistant_msg)
+                            final_text = extracted["text"]
+                            final_citations = _dedupe_sources(extracted["citations"])
+                            final_images = extracted.get("images", [])
+                            
+                            # Update citations if we got more from final extraction
+                            if final_citations:
+                                citations = final_citations
+                            
+                            # Update images if we got more
+                            if final_images:
+                                images = final_images
+                            
+                            # Get usage from run
+                            if hasattr(event, "data") and hasattr(event.data, "usage"):
+                                usage = {
+                                    "input_tokens": getattr(event.data.usage, "prompt_tokens", 0),
+                                    "output_tokens": getattr(event.data.usage, "completion_tokens", 0),
+                                    "total_tokens": getattr(event.data.usage, "total_tokens", 0)
+                                }
+                            
+                            # Download images and convert to base64
+                            image_data = []
+                            for img in images:
+                                file_id = img.get("file_id")
+                                if file_id:
+                                    try:
+                                        file_response = client.files.content(file_id)
+                                        image_bytes = file_response.read()
+                                        
+                                        try:
+                                            file_info = client.files.retrieve(file_id)
+                                            filename = getattr(file_info, "filename", "image.png")
+                                            content_type, _ = mimetypes.guess_type(filename)
+                                            if not content_type:
+                                                content_type = "image/png"
+                                        except Exception:
+                                            content_type = "image/png"
+                                        
+                                        base64_data = base64.b64encode(image_bytes).decode("utf-8")
+                                        data_url = f"data:{content_type};base64,{base64_data}"
+                                        
+                                        image_data.append({
+                                            "file_id": file_id,
+                                            "data_url": data_url
+                                        })
+                                    except Exception:
+                                        pass
+                            
+                            # Use accumulated text if final_text is empty
+                            if not final_text and accumulated_text:
+                                final_text = accumulated_text
+                            
+                            # Shape final payload
+                            shaped = _shape_structured_payload(final_text, [
+                                {
+                                    "file_id": c["file_id"],
+                                    "filename": _filename_for_file_id(c["file_id"]),
+                                    "quote": c.get("quote", "")
+                                }
+                                for c in citations
+                            ])
+                            
+                            yield {
+                                "type": "done",
+                                "answer": shaped.get("answer", ""),
+                                "bullets": shaped.get("bullets"),
+                                "sources": [
+                                    {
+                                        "file_id": c["file_id"],
+                                        "filename": _filename_for_file_id(c["file_id"]),
+                                        "quote": c.get("quote", "")
+                                    }
+                                    for c in citations
+                                ],
+                                "images": image_data,
+                                "usage": usage
+                            }
+                    except Exception as e:
+                        yield {
+                            "type": "error",
+                            "error": str(e)
+                        }
+                
+                # Handle errors
+                if event.event == "error":
+                    yield {
+                        "type": "error",
+                        "error": str(event.data) if hasattr(event, "data") else "Unknown error"
+                    }
+    except Exception as e:
+        yield {
+            "type": "error",
+            "error": f"Stream error: {str(e)}"
+        }
