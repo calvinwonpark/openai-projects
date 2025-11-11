@@ -911,31 +911,41 @@
                   }
                 }
                 
-                // Update sources and images (aggregate from both)
+                // Update sources and images (aggregate from both phases)
                 if (data.sources) {
-                  finalStructuredData.sources = data.sources || finalStructuredData.sources;
+                  // Initialize sources array if needed
+                  if (!finalStructuredData.sources) {
+                    finalStructuredData.sources = [];
+                  }
+                  // Merge sources, avoiding duplicates
+                  const newSources = data.sources || [];
+                  const existingFileIds = new Set(finalStructuredData.sources.map(s => s.file_id));
+                  newSources.forEach(source => {
+                    if (source.file_id && !existingFileIds.has(source.file_id)) {
+                      finalStructuredData.sources.push(source);
+                      existingFileIds.add(source.file_id);
+                    }
+                  });
                 }
                 if (data.images) {
-                  finalStructuredData.images = data.images || finalStructuredData.images;
+                  // Initialize images array if needed
+                  if (!finalStructuredData.images) {
+                    finalStructuredData.images = [];
+                  }
+                  // Merge images, avoiding duplicates
+                  const newImages = data.images || [];
+                  const existingImageIds = new Set(finalStructuredData.images.map(img => img.file_id));
+                  newImages.forEach(image => {
+                    if (image.file_id && !existingImageIds.has(image.file_id)) {
+                      finalStructuredData.images.push(image);
+                      existingImageIds.add(image.file_id);
+                    }
+                  });
                 }
                 
-                // Remove streaming indicator for this phase when done
-                // Check if this is the final done (both phases complete for multi-phase responses)
-                if (contentDiv) {
-                  // Build combined text
-                  let combinedText = primaryText;
-                  if (reviewerText) {
-                    const strategy = routingInfo?.strategy || 'parallel_ensemble';
-                    const reviewerLabel = routingInfo?.reviewer_label || 'reviewer';
-                    const phaseLabel = strategy === 'consult_then_decide' 
-                      ? `${reviewerLabel.charAt(0).toUpperCase() + reviewerLabel.slice(1)}Advisor Critique (Devil's Advocate):`
-                      : `${reviewerLabel.charAt(0).toUpperCase() + reviewerLabel.slice(1)}Advisor Perspective:`;
-                    combinedText += `\n\n**${phaseLabel}**\n\n${reviewerText}`;
-                  }
-                  const formatted = formatStreamingText(combinedText);
-                  // Remove streaming indicator - stream is done for this phase
-                  contentDiv.innerHTML = `<div>${formatted}</div>`;
-                }
+                // Don't update contentDiv here - wait until stream fully ends
+                // This prevents overwriting sources that were displayed during streaming
+                // The final updateMessageWithStructuredData call will handle everything
               }
               
               // Handle errors
@@ -960,13 +970,7 @@
         finalAccumulatedText += `\n\n**${phaseLabel}**\n\n${reviewerText}`;
       }
       
-      // Remove loading indicator and finalize message
-      if (contentDiv) {
-        contentDiv.className = 'message-content';
-        // Ensure streaming indicator is removed (stream is fully complete)
-        const formatted = formatStreamingText(finalAccumulatedText);
-        contentDiv.innerHTML = `<div>${formatted}</div>`;
-      }
+      // Remove loading indicator
       loadingMsg.classList.remove('loading');
       
       // Finalize the message with structured data
@@ -975,7 +979,18 @@
         if (!finalStructuredData.answer && finalAccumulatedText) {
           finalStructuredData.answer = finalAccumulatedText;
         }
+        // Ensure sources and images arrays are initialized
+        if (!finalStructuredData.sources) {
+          finalStructuredData.sources = [];
+        }
+        if (!finalStructuredData.images) {
+          finalStructuredData.images = [];
+        }
+        // Update the message with all structured data (answer, bullets, sources, images)
         updateMessageWithStructuredData(loadingMsg, finalStructuredData);
+      } else if (contentDiv) {
+        // If no structured data, at least ensure contentDiv has the right class
+        contentDiv.className = 'message-content';
       }
       
     } catch (error) {
