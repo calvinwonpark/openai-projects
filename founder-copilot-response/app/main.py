@@ -3,12 +3,14 @@ import time
 import json
 from fastapi import FastAPI, Request, Depends, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse, FileResponse, StreamingResponse
+from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, Response
 from typing import List, Optional
 from dotenv import load_dotenv
 
-from app.openai_client import create_thread, add_message, run_assistant_structured, run_assistant_stream, upload_file
-from app.storage import get_ids, get_assistant_ids, get_all_assistant_ids
+from app.openai_client import create_thread, add_message, run_assistant_structured, run_assistant_stream, upload_file, download_file_bytes, download_container_file_bytes
+from app.storage import get_ids, get_response_ids, get_all_response_ids
+# Note: create_thread, run_assistant_structured, run_assistant_stream are compatibility wrappers
+# that map to Responses API functions (create_conversation, run_response, etc.)
 from app.router import route_query
 from app.metrics import metrics
 from app.product_card import (
@@ -26,13 +28,24 @@ app = FastAPI()
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
 
-THREADS = {}  # per-session demo (in-memory) - stores thread_id per session
-THREADS_BY_ASSISTANT = {}  # Stores thread_id per assistant label per session
+# Conversation management (Responses API uses conversations instead of threads)
+CONVERSATIONS = {}  # per-session demo (in-memory) - stores conversation_id per session
+CONVERSATIONS_BY_LABEL = {}  # Stores conversation_id per response label per session
 SESSION_PRODUCT_IDS = {}  # Track active product_id per session (IP-based for now)
 SESSION_PRODUCED_FILES = {}  # Track files produced in previous turns per session
-THREAD_UPLOADED_FILES = {}  # Track files uploaded to each thread: {thread_id: [file_ids]}
-SESSION_ANALYSIS_THREAD = {}  # Shared analysis thread for data flows (CSV/analysis iterations): {session_id: thread_id}
-SESSION_ANALYSIS_FILES = {}  # Track files in the shared analysis thread: {session_id: [file_ids]}
+CONVERSATION_UPLOADED_FILES = {}  # Track files uploaded to each conversation: {conversation_id: [file_ids]}
+SESSION_ANALYSIS_CONVERSATION = {}  # Shared analysis conversation for data flows (CSV/analysis iterations): {session_id: conversation_id}
+SESSION_ANALYSIS_FILES = {}  # Track files in the shared analysis conversation: {session_id: [file_ids]}
+
+# Legacy aliases for backward compatibility (deprecated - use CONVERSATIONS instead)
+RESPONSES = CONVERSATIONS
+RESPONSES_BY_LABEL = CONVERSATIONS_BY_LABEL
+THREADS = CONVERSATIONS
+THREADS_BY_ASSISTANT = CONVERSATIONS_BY_LABEL
+RESPONSE_UPLOADED_FILES = CONVERSATION_UPLOADED_FILES
+THREAD_UPLOADED_FILES = CONVERSATION_UPLOADED_FILES
+SESSION_ANALYSIS_RESPONSE = SESSION_ANALYSIS_CONVERSATION
+SESSION_ANALYSIS_THREAD = SESSION_ANALYSIS_CONVERSATION
 
 async def client_ip(req: Request) -> str:
     xff = req.headers.get("x-forwarded-for")
@@ -57,7 +70,7 @@ def set_active_product_id(session_id: str, product_id: str):
     SESSION_PRODUCT_IDS[session_id] = product_id
 
 def track_produced_files(session_id: str, file_ids: List[str]):
-    """Track files produced in assistant responses."""
+    """Track files produced in response outputs (e.g., charts from code_interpreter)."""
     if session_id not in SESSION_PRODUCED_FILES:
         SESSION_PRODUCED_FILES[session_id] = []
     existing = set(SESSION_PRODUCED_FILES[session_id])
@@ -68,17 +81,26 @@ def get_produced_files(session_id: str) -> List[str]:
     """Get files produced in previous turns."""
     return SESSION_PRODUCED_FILES.get(session_id, [])
 
-def track_thread_files(thread_id: str, file_ids: List[str]):
-    """Track files uploaded to a specific thread."""
-    if thread_id not in THREAD_UPLOADED_FILES:
-        THREAD_UPLOADED_FILES[thread_id] = []
-    existing = set(THREAD_UPLOADED_FILES[thread_id])
+def track_conversation_files(conversation_id: str, file_ids: List[str]):
+    """Track files uploaded to a specific conversation."""
+    if conversation_id not in CONVERSATION_UPLOADED_FILES:
+        CONVERSATION_UPLOADED_FILES[conversation_id] = []
+    existing = set(CONVERSATION_UPLOADED_FILES[conversation_id])
     new_files = [fid for fid in file_ids if fid not in existing]
-    THREAD_UPLOADED_FILES[thread_id].extend(new_files)
+    CONVERSATION_UPLOADED_FILES[conversation_id].extend(new_files)
 
-def get_thread_files(thread_id: str) -> List[str]:
-    """Get files previously uploaded to a thread."""
-    return THREAD_UPLOADED_FILES.get(thread_id, [])
+def get_conversation_files(conversation_id: str) -> List[str]:
+    """Get files previously uploaded to a conversation."""
+    return CONVERSATION_UPLOADED_FILES.get(conversation_id, [])
+
+# Legacy aliases for backward compatibility
+def track_thread_files(conversation_id: str, file_ids: List[str]):
+    """Legacy alias - use track_conversation_files instead."""
+    return track_conversation_files(conversation_id, file_ids)
+
+def get_thread_files(conversation_id: str) -> List[str]:
+    """Legacy alias - use get_conversation_files instead."""
+    return get_conversation_files(conversation_id)
 
 def detect_data_reference(user_message: str) -> bool:
     """Detect if user message references data/files from previous conversation."""
@@ -111,15 +133,15 @@ def is_data_analysis_flow(user_message: str, has_files: bool) -> bool:
     # If user uploaded files (CSV, Excel) or is asking about data analysis, it's a data flow
     return has_files or (has_analysis_keywords and detect_data_reference(user_message))
 
-def get_or_create_analysis_thread(session_id: str) -> str:
-    """Get or create a shared analysis thread for data flows."""
-    if session_id not in SESSION_ANALYSIS_THREAD:
-        th = create_thread()
-        SESSION_ANALYSIS_THREAD[session_id] = th.id
-    return SESSION_ANALYSIS_THREAD[session_id]
+def get_or_create_analysis_conversation(session_id: str) -> str:
+    """Get or create a shared analysis conversation for data flows."""
+    if session_id not in SESSION_ANALYSIS_CONVERSATION:
+        conversation = create_thread()  # create_thread creates a conversation in Responses API
+        SESSION_ANALYSIS_CONVERSATION[session_id] = conversation.id
+    return SESSION_ANALYSIS_CONVERSATION[session_id]
 
 def track_analysis_files(session_id: str, file_ids: List[str]):
-    """Track files in the shared analysis thread."""
+    """Track files in the shared analysis conversation."""
     if session_id not in SESSION_ANALYSIS_FILES:
         SESSION_ANALYSIS_FILES[session_id] = []
     existing = set(SESSION_ANALYSIS_FILES[session_id])
@@ -127,8 +149,13 @@ def track_analysis_files(session_id: str, file_ids: List[str]):
     SESSION_ANALYSIS_FILES[session_id].extend(new_files)
 
 def get_analysis_files(session_id: str) -> List[str]:
-    """Get files from the shared analysis thread."""
+    """Get files from the shared analysis conversation."""
     return SESSION_ANALYSIS_FILES.get(session_id, [])
+
+# Legacy alias for backward compatibility
+def get_or_create_analysis_thread(session_id: str) -> str:
+    """Legacy alias - use get_or_create_analysis_conversation instead."""
+    return get_or_create_analysis_conversation(session_id)
 
 redis_client = None
 
@@ -151,57 +178,74 @@ def health():
 
 @app.post("/reset", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
 async def reset(request: Request):
-    """Reset conversation threads (both legacy and multi-assistant)."""
+    """Reset conversations (Responses API uses conversations instead of threads)."""
     session_id = await get_session_id(request)
-    th = create_thread()
-    THREADS["thread_id"] = th.id
-    THREADS_BY_ASSISTANT.clear()  # Clear all assistant-specific threads
-    # Clear analysis thread for this session
-    if session_id in SESSION_ANALYSIS_THREAD:
-        del SESSION_ANALYSIS_THREAD[session_id]
+    conversation = create_thread()  # Creates a new conversation
+    CONVERSATIONS["conversation_id"] = conversation.id
+    CONVERSATIONS_BY_LABEL.clear()  # Clear all label-specific conversations
+    # Clear analysis conversation for this session
+    if session_id in SESSION_ANALYSIS_CONVERSATION:
+        del SESSION_ANALYSIS_CONVERSATION[session_id]
     if session_id in SESSION_ANALYSIS_FILES:
         del SESSION_ANALYSIS_FILES[session_id]
-    return {"thread_id": th.id, "message": "All threads reset"}
+    return {"thread_id": conversation.id, "message": "All conversations reset"}  # Keep thread_id in response for API compatibility
 
 def _has_grounded_content(result: dict) -> bool:
-    """Check if assistant retrieved grounded content (sources or substantial answer)."""
+    """Check if response retrieved grounded content (sources or substantial answer)."""
     sources = result.get("sources", [])
     answer = result.get("answer", "").strip()
     # Consider it grounded if there are sources or a substantial answer (>50 chars)
     return len(sources) > 0 or len(answer) > 50
 
+def _get_or_create_conversation(label: str) -> str:
+    """Get or create a conversation for a specific response label."""
+    if label not in CONVERSATIONS_BY_LABEL:
+        conversation = create_thread()  # create_thread creates a conversation in Responses API
+        CONVERSATIONS_BY_LABEL[label] = conversation.id
+    return CONVERSATIONS_BY_LABEL[label]
+
+# Legacy alias for backward compatibility
 def _get_or_create_thread(label: str) -> str:
-    """Get or create a thread for a specific assistant label."""
-    if label not in THREADS_BY_ASSISTANT:
-        th = create_thread()
-        THREADS_BY_ASSISTANT[label] = th.id
-    return THREADS_BY_ASSISTANT[label]
+    """Legacy alias - use _get_or_create_conversation instead."""
+    return _get_or_create_conversation(label)
 
 # main costed endpoint: 3 req / 60s per IP
+# This endpoint uses Responses API exclusively:
+# - Conversations API (client.conversations.create) for conversation management
+# - Responses API (client.responses.create) for generating responses
+# - In-memory conversation history tracking (passed as input to responses.create)
 @app.post("/chat", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
 async def chat(
     request: Request,
     message: str = Form(...),
     files: Optional[List[UploadFile]] = File(None)
 ):
+    """
+    Chat endpoint using Responses API.
+    
+    Uses:
+    - Conversations API for conversation management (create_thread -> conversations.create)
+    - Responses API for response generation (run_assistant_structured -> responses.create)
+    - In-memory conversation history tracking (passed as input parameter)
+    """
     start_time = time.time()
     user_msg = message.strip()
     if not user_msg:
         return JSONResponse({"error": "message required"}, status_code=400)
 
     # Check if multi-assistant setup exists, fallback to legacy single assistant
-    all_assistants = get_all_assistant_ids()
-    if not all_assistants:
+    all_responses = get_all_response_ids()
+    if not all_responses:
         # Legacy single assistant mode
-        assistant_id, _ = get_ids()
-        if not assistant_id:
-            return JSONResponse({"error": "Seed first: python scripts/seed_multi_assistants.py"}, status_code=500)
+        response_id, _ = get_ids()
+        if not response_id:
+            return JSONResponse({"error": "Seed first: python scripts/seed_multi_responses.py"}, status_code=500)
         
-        thread_id = THREADS.get("thread_id")
-        if not thread_id:
-            th = create_thread()
-            thread_id = th.id
-            THREADS["thread_id"] = thread_id
+        conversation_id = CONVERSATIONS.get("conversation_id")
+        if not conversation_id:
+            conversation = create_thread()  # Creates a conversation in Responses API
+            conversation_id = conversation.id
+            CONVERSATIONS["conversation_id"] = conversation_id
         
         try:
             file_ids = []
@@ -212,18 +256,18 @@ async def chat(
                         uploaded_file = upload_file(file_content, file.filename)
                         file_ids.append(uploaded_file.id)
             
-            # If no new files but user is asking about data, re-attach previous files from this thread
+            # If no new files but user is asking about data, re-attach previous files from this conversation
             if not file_ids and detect_data_reference(user_msg):
-                previous_files = get_thread_files(thread_id)
+                previous_files = get_conversation_files(conversation_id)
                 if previous_files:
                     file_ids = previous_files
             
-            # Track files uploaded to this thread
+            # Track files uploaded to this conversation
             if file_ids:
-                track_thread_files(thread_id, file_ids)
+                track_conversation_files(conversation_id, file_ids)
             
-            add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
-            result = run_assistant_structured(thread_id, assistant_id)
+            add_message(conversation_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+            result = run_assistant_structured(conversation_id, response_id)  # conversation_id is used as conversation_id, response_id is response_config_id
             
             latency_ms = (time.time() - start_time) * 1000
             usage = result.get("usage", {})
@@ -237,7 +281,7 @@ async def chat(
             )
             
             return {
-                "thread_id": thread_id,
+                "thread_id": conversation_id,  # Keep thread_id in response for API compatibility
                 "answer": result.get("answer", ""),
                 "sources": result.get("sources", []),
                 "raw_text": result.get("raw_text", ""),
@@ -246,9 +290,15 @@ async def chat(
                 "usage": usage
             }
         except Exception as e:
+            import traceback
+            error_trace = traceback.format_exc()
             latency_ms = (time.time() - start_time) * 1000
             metrics.record_request(latency_ms=latency_ms, error=True)
-            return JSONResponse({"error": str(e)}, status_code=500)
+            # Include traceback in development for debugging
+            error_msg = str(e)
+            if os.getenv("DEBUG", "false").lower() == "true":
+                error_msg += f"\n\nTraceback:\n{error_trace}"
+            return JSONResponse({"error": error_msg, "traceback": error_trace}, status_code=500)
     
     # Multi-assistant routing mode
     try:
@@ -275,11 +325,11 @@ async def chat(
         # Check if this is a data analysis flow
         is_data_flow = is_data_analysis_flow(user_msg, bool(file_ids))
         
-        # Step 3: Handle data analysis flows with shared analysis thread
+        # Step 3: Handle data analysis flows with shared analysis conversation
         if is_data_flow:
-            analysis_thread_id = get_or_create_analysis_thread(session_id)
+            analysis_conversation_id = get_or_create_analysis_conversation(session_id)
             
-            # Track files in analysis thread
+            # Track files in analysis conversation
             analysis_file_ids = list(file_ids) if file_ids else []
             if not analysis_file_ids:
                 previous_analysis_files = get_analysis_files(session_id)
@@ -290,15 +340,15 @@ async def chat(
                 track_analysis_files(session_id, file_ids)
             
             # Use InvestorAdvisor for data analysis (has code_interpreter)
-            assistant_id, _ = get_assistant_ids("investor")
-            if not assistant_id:
-                assistant_id, _ = get_assistant_ids(label)
+            response_id, _ = get_response_ids("investor")
+            if not response_id:
+                response_id, _ = get_response_ids(label)
             
-            if not assistant_id:
-                return JSONResponse({"error": f"Assistant not found. Run: python scripts/seed_multi_assistants.py"}, status_code=500)
+            if not response_id:
+                return JSONResponse({"error": f"Response not found. Run: python scripts/seed_multi_responses.py"}, status_code=500)
             
-            add_message(analysis_thread_id, "user", user_msg, file_ids=analysis_file_ids if analysis_file_ids else None)
-            result = run_assistant_structured(analysis_thread_id, assistant_id)
+            add_message(analysis_conversation_id, "user", user_msg, file_ids=analysis_file_ids if analysis_file_ids else None)
+            result = run_assistant_structured(analysis_conversation_id, response_id)  # conversation_id is used as conversation_id, response_id is response_config_id
             
             latency_ms = (time.time() - start_time) * 1000
             usage = result.get("usage", {})
@@ -312,7 +362,7 @@ async def chat(
             )
             
             return {
-                "thread_id": analysis_thread_id,
+                "thread_id": analysis_conversation_id,  # Keep thread_id in response for API compatibility
                 "answer": result.get("answer", ""),
                 "sources": result.get("sources", []),
                 "raw_text": result.get("raw_text", ""),
@@ -324,11 +374,11 @@ async def chat(
         
         # Step 4: Normal routing (not data analysis)
         # Determine routing strategy
-        primary_assistant_id, _ = get_assistant_ids(label)
-        reviewer_assistant_id, _ = get_assistant_ids(top2_label)
+        primary_response_id, _ = get_response_ids(label)
+        reviewer_response_id, _ = get_response_ids(top2_label)
         
-        if not primary_assistant_id:
-            return JSONResponse({"error": f"Assistant '{label}' not found. Run: python scripts/seed_multi_assistants.py"}, status_code=500)
+        if not primary_response_id:
+            return JSONResponse({"error": f"Response '{label}' not found. Run: python scripts/seed_multi_responses.py"}, status_code=500)
         
         primary_result = None
         reviewer_result = None
@@ -336,60 +386,60 @@ async def chat(
         
         # Strategy 1: Winner-take-all (confidence >= 0.8)
         if confidence >= 0.8:
-            thread_id = _get_or_create_thread(label)
+            conversation_id = _get_or_create_conversation(label)
             
-            # If no new files but user is asking about data, re-attach previous files from this thread
+            # If no new files but user is asking about data, re-attach previous files from this conversation
             if not file_ids and detect_data_reference(user_msg):
-                previous_files = get_thread_files(thread_id)
+                previous_files = get_conversation_files(conversation_id)
                 if previous_files:
                     file_ids = previous_files
             
-            # Track files uploaded to this thread
+            # Track files uploaded to this conversation
             if file_ids:
-                track_thread_files(thread_id, file_ids)
+                track_conversation_files(conversation_id, file_ids)
             
-            add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
-            primary_result = run_assistant_structured(thread_id, primary_assistant_id)
+            add_message(conversation_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+            primary_result = run_assistant_structured(conversation_id, primary_response_id)  # conversation_id is used as conversation_id, response_id is response_config_id
             total_usage = primary_result.get("usage", {})
         
         # Strategy 2: Consult-then-decide (0.5 <= confidence < 0.8 OR high-risk)
         elif (0.5 <= confidence < 0.8) or is_high_risk:
-            if not reviewer_assistant_id:
+            if not reviewer_response_id:
                 # Fallback to primary only if reviewer not available
-                thread_id = _get_or_create_thread(label)
+                conversation_id = _get_or_create_conversation(label)
                 
-                # If no new files but user is asking about data, re-attach previous files from this thread
+                # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not file_ids and detect_data_reference(user_msg):
-                    previous_files = get_thread_files(thread_id)
+                    previous_files = get_conversation_files(conversation_id)
                     if previous_files:
                         file_ids = previous_files
                 
-                # Track files uploaded to this thread
+                # Track files uploaded to this conversation
                 if file_ids:
-                    track_thread_files(thread_id, file_ids)
+                    track_conversation_files(conversation_id, file_ids)
                 
-                add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
-                primary_result = run_assistant_structured(thread_id, primary_assistant_id)
+                add_message(conversation_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+                primary_result = run_assistant_structured(conversation_id, primary_response_id)
                 total_usage = primary_result.get("usage", {})
             else:
                 # Run primary first
-                thread_id_primary = _get_or_create_thread(label)
+                conversation_id_primary = _get_or_create_conversation(label)
                 
-                # If no new files but user is asking about data, re-attach previous files from this thread
+                # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not file_ids and detect_data_reference(user_msg):
-                    previous_files = get_thread_files(thread_id_primary)
+                    previous_files = get_conversation_files(conversation_id_primary)
                     if previous_files:
                         file_ids = previous_files
                 
-                # Track files uploaded to this thread
+                # Track files uploaded to this conversation
                 if file_ids:
-                    track_thread_files(thread_id_primary, file_ids)
+                    track_conversation_files(conversation_id_primary, file_ids)
                 
-                add_message(thread_id_primary, "user", user_msg, file_ids=file_ids if file_ids else None)
-                primary_result = run_assistant_structured(thread_id_primary, primary_assistant_id)
+                add_message(conversation_id_primary, "user", user_msg, file_ids=file_ids if file_ids else None)
+                primary_result = run_assistant_structured(conversation_id_primary, primary_response_id)
                 
                 # Then ask reviewer to critique (Devil's Advocate pass)
-                thread_id_reviewer = _get_or_create_thread(top2_label)
+                conversation_id_reviewer = _get_or_create_conversation(top2_label)
                 primary_answer = primary_result.get("answer", "")
                 primary_bullets = primary_result.get("bullets", [])
                 
@@ -414,8 +464,8 @@ Please provide a "Devil's Advocate" critique from a {top2_label} perspective. Sp
 
 Be constructive and specific. Focus on adding value, not just criticizing."""
                 
-                add_message(thread_id_reviewer, "user", critique_prompt, file_ids=file_ids if file_ids else None)
-                reviewer_result = run_assistant_structured(thread_id_reviewer, reviewer_assistant_id)
+                add_message(conversation_id_reviewer, "user", critique_prompt, file_ids=file_ids if file_ids else None)
+                reviewer_result = run_assistant_structured(conversation_id_reviewer, reviewer_response_id)  # conversation_id is used as conversation_id, response_id is response_config_id
                 
                 # Aggregate usage
                 primary_usage = primary_result.get("usage", {})
@@ -428,44 +478,44 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
         
         # Strategy 3: Parallel ensemble (confidence < 0.5 OR margin < 0.15)
         else:
-            if not reviewer_assistant_id:
+            if not reviewer_response_id:
                 # Fallback to primary only
-                thread_id = _get_or_create_thread(label)
+                conversation_id = _get_or_create_conversation(label)
                 
-                # If no new files but user is asking about data, re-attach previous files from this thread
+                # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not file_ids and detect_data_reference(user_msg):
-                    previous_files = get_thread_files(thread_id)
+                    previous_files = get_conversation_files(conversation_id)
                     if previous_files:
                         file_ids = previous_files
                 
-                # Track files uploaded to this thread
+                # Track files uploaded to this conversation
                 if file_ids:
-                    track_thread_files(thread_id, file_ids)
+                    track_conversation_files(conversation_id, file_ids)
                 
-                add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
-                primary_result = run_assistant_structured(thread_id, primary_assistant_id)
+                add_message(conversation_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+                primary_result = run_assistant_structured(conversation_id, primary_response_id)
                 total_usage = primary_result.get("usage", {})
             else:
                 # Run both in parallel (sequentially for now, but could be parallelized)
-                thread_id_primary = _get_or_create_thread(label)
+                conversation_id_primary = _get_or_create_conversation(label)
                 
-                # If no new files but user is asking about data, re-attach previous files from this thread
+                # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not file_ids and detect_data_reference(user_msg):
-                    previous_files = get_thread_files(thread_id_primary)
+                    previous_files = get_conversation_files(conversation_id_primary)
                     if previous_files:
                         file_ids = previous_files
                 
-                # Track files uploaded to this thread
+                # Track files uploaded to this conversation
                 if file_ids:
-                    track_thread_files(thread_id_primary, file_ids)
+                    track_conversation_files(conversation_id_primary, file_ids)
                 
-                add_message(thread_id_primary, "user", user_msg, file_ids=file_ids if file_ids else None)
-                primary_result = run_assistant_structured(thread_id_primary, primary_assistant_id)
+                add_message(conversation_id_primary, "user", user_msg, file_ids=file_ids if file_ids else None)
+                primary_result = run_assistant_structured(conversation_id_primary, primary_response_id)
                 
-                thread_id_reviewer = _get_or_create_thread(top2_label)
+                conversation_id_reviewer = _get_or_create_conversation(top2_label)
                 # Reviewer also gets the same files if available
-                add_message(thread_id_reviewer, "user", user_msg, file_ids=file_ids if file_ids else None)
-                reviewer_result = run_assistant_structured(thread_id_reviewer, reviewer_assistant_id)
+                add_message(conversation_id_reviewer, "user", user_msg, file_ids=file_ids if file_ids else None)
+                reviewer_result = run_assistant_structured(conversation_id_reviewer, reviewer_response_id)  # conversation_id is used as conversation_id, response_id is response_config_id
                 
                 # Aggregate usage
                 primary_usage = primary_result.get("usage", {})
@@ -479,7 +529,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
         # Step 4: Check if both assistants retrieved nothing (for ensemble cases)
         if reviewer_result and not _has_grounded_content(primary_result) and not _has_grounded_content(reviewer_result):
             return {
-                "thread_id": _get_or_create_thread(label),
+                "thread_id": _get_or_create_conversation(label),  # Keep thread_id in response for API compatibility
                 "answer": "I need a bit more context to help you effectively. Could you clarify:\n- What specific aspect are you most interested in?\n- Are you looking for technical guidance, marketing strategy, or investor/fundraising advice?\n- What's your current situation or challenge?",
                 "sources": [],
                 "raw_text": "",
@@ -557,7 +607,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
         )
         
         return {
-            "thread_id": _get_or_create_thread(label),
+            "thread_id": _get_or_create_conversation(label),  # Keep thread_id in response for API compatibility
             "answer": answer,
             "sources": sources,
             "raw_text": primary_result.get("raw_text", "") if primary_result else "",
@@ -568,9 +618,15 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
         }
         
     except Exception as e:
+        import traceback
+        error_trace = traceback.format_exc()
         latency_ms = (time.time() - start_time) * 1000
         metrics.record_request(latency_ms=latency_ms, error=True)
-        return JSONResponse({"error": str(e)}, status_code=500)
+        # Include traceback in development for debugging
+        error_msg = str(e)
+        if os.getenv("DEBUG", "false").lower() == "true":
+            error_msg += f"\n\nTraceback:\n{error_trace}"
+        return JSONResponse({"error": error_msg, "traceback": error_trace}, status_code=500)
 
 @app.get("/")
 def root():
@@ -592,72 +648,30 @@ def metrics_page():
     """Serve the metrics dashboard page."""
     return FileResponse("app/static/metrics.html")
 
-@app.post("/api/product-card", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
-async def create_or_update_product_card_endpoint(
-    request: Request,
-    product_id: str = Form(...),
-    name: str = Form(...),
-    description: str = Form(...),
-    target_audience: str = Form(...),
-    problem_uvp: str = Form(...),
-    key_features: str = Form(...),  # JSON array as string
-    stage: str = Form(...),  # "idea" | "MVP" | "GA"
-    constraints: str = Form(...),  # JSON object as string
-    files: Optional[str] = Form(None)  # JSON array of file IDs as string
-):
-    """Create or update a product card."""
+@app.get("/api/file/{file_id}")
+def get_file(file_id: str):
+    """Download a file from OpenAI Files API."""
     try:
-        session_id = await get_session_id(request)
-        
-        # Parse JSON fields
-        try:
-            features_list = json.loads(key_features) if key_features else []
-        except:
-            features_list = [key_features] if key_features else []
-        
-        try:
-            constraints_dict = json.loads(constraints) if constraints else {}
-        except:
-            constraints_dict = {}
-        
-        try:
-            files_list = json.loads(files) if files else []
-        except:
-            files_list = []
-        
-        card = create_or_update_product_card(
-            product_id=product_id,
-            name=name,
-            description=description,
-            target_audience=target_audience,
-            problem_uvp=problem_uvp,
-            key_features=features_list,
-            stage=stage,
-            constraints=constraints_dict,
-            files=files_list
-        )
-        
-        # Set as active product for this session
-        set_active_product_id(session_id, product_id)
-        
-        return {"status": "success", "product_card": card}
+        data = download_file_bytes(file_id)
+        return Response(content=data, media_type="application/octet-stream")
     except Exception as e:
-        return JSONResponse({"error": str(e)}, status_code=500)
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Could not download file {file_id}: {str(e)}"}
+        )
 
-@app.get("/api/product-card/{product_id}")
-def get_product_card_endpoint(product_id: str):
-    """Get a product card by ID."""
-    card = get_product_card(product_id)
-    if card:
-        return {"status": "success", "product_card": card}
-    return JSONResponse({"error": "Product card not found"}, status_code=404)
-
-@app.get("/api/product-cards")
-def get_all_product_cards_endpoint():
-    """Get all product cards."""
-    cards = get_all_product_cards()
-    return {"status": "success", "product_cards": cards}
-
+@app.get("/api/container-file/{container_id}/{file_id}")
+def get_container_file(container_id: str, file_id: str):
+    """Download a container file (e.g., image generated by code_interpreter)."""
+    try:
+        data = download_container_file_bytes(container_id, file_id)
+        # PNG is most common; octet-stream would also work
+        return Response(content=data, media_type="image/png")
+    except Exception as e:
+        return JSONResponse(
+            status_code=404,
+            content={"error": f"Could not download container file {file_id}: {str(e)}"}
+        )
 
 @app.post("/chat/stream", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
 async def chat_stream(
@@ -694,34 +708,34 @@ async def chat_stream(
         nonlocal file_ids  # Allow modification of outer scope variable
         try:
             # Check if multi-assistant setup exists
-            all_assistants = get_all_assistant_ids()
-            if not all_assistants:
+            all_responses = get_all_response_ids()
+            if not all_responses:
                 # Legacy single assistant mode
-                assistant_id, _ = get_ids()
-                if not assistant_id:
-                    yield f"data: {json.dumps({'type': 'error', 'error': 'Seed first: python scripts/seed_multi_assistants.py'})}\n\n"
+                response_id, _ = get_ids()
+                if not response_id:
+                    yield f"data: {json.dumps({'type': 'error', 'error': 'Seed first: python scripts/seed_multi_responses.py'})}\n\n"
                     return
                 
-                thread_id = THREADS.get("thread_id")
-                if not thread_id:
-                    th = create_thread()
-                    thread_id = th.id
-                    THREADS["thread_id"] = thread_id
+                conversation_id = CONVERSATIONS.get("conversation_id")
+                if not conversation_id:
+                    conversation = create_thread()  # Creates a conversation in Responses API
+                    conversation_id = conversation.id
+                    CONVERSATIONS["conversation_id"] = conversation_id
                 
-                # If no new files but user is asking about data, re-attach previous files from this thread
+                # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not file_ids and detect_data_reference(user_msg):
-                    previous_files = get_thread_files(thread_id)
+                    previous_files = get_conversation_files(conversation_id)
                     if previous_files:
                         file_ids = previous_files
                 
-                # Track files uploaded to this thread
+                # Track files uploaded to this conversation
                 if file_ids:
-                    track_thread_files(thread_id, file_ids)
+                    track_conversation_files(conversation_id, file_ids)
                 
-                add_message(thread_id, "user", user_msg, file_ids=file_ids if file_ids else None)
+                add_message(conversation_id, "user", user_msg, file_ids=file_ids if file_ids else None)
                 
                 # Stream response
-                for chunk in run_assistant_stream(thread_id, assistant_id):
+                for chunk in run_assistant_stream(conversation_id, response_id):  # conversation_id is used as conversation_id, response_id is response_config_id
                     chunk["routing"] = {"strategy": "legacy"}
                     yield f"data: {json.dumps(chunk)}\n\n"
                     
@@ -778,12 +792,12 @@ async def chat_stream(
                     # No products exist - could ask to create one, but for now just proceed
                     pass
             
-            # Data analysis flow: use shared analysis thread for CSV/data iterations
+            # Data analysis flow: use shared analysis conversation for CSV/data iterations
             if is_data_flow:
-                # Use shared analysis thread for data flows
-                analysis_thread_id = get_or_create_analysis_thread(session_id)
+                # Use shared analysis conversation for data flows
+                analysis_conversation_id = get_or_create_analysis_conversation(session_id)
                 
-                # Track files in analysis thread
+                # Track files in analysis conversation
                 analysis_file_ids = list(file_ids) if file_ids else []
                 if not analysis_file_ids:
                     # If no new files, get previous analysis files
@@ -797,23 +811,23 @@ async def chat_stream(
                 # For data flows, use InvestorAdvisor (has code_interpreter) or the routed assistant
                 # But prefer InvestorAdvisor for data analysis
                 if label == "investor" or is_data_flow:
-                    assistant_id, _ = get_assistant_ids("investor")
-                    if not assistant_id:
-                        assistant_id, _ = get_assistant_ids(label)
+                    response_id, _ = get_response_ids("investor")
+                    if not response_id:
+                        response_id, _ = get_response_ids(label)
                 else:
-                    assistant_id, _ = get_assistant_ids(label)
+                    response_id, _ = get_response_ids(label)
                 
-                if not assistant_id:
-                    error_msg = f"Assistant not found. Run: python scripts/seed_multi_assistants.py"
+                if not response_id:
+                    error_msg = f"Response not found. Run: python scripts/seed_multi_responses.py"
                     yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
                     return
                 
-                add_message(analysis_thread_id, "user", user_msg, file_ids=analysis_file_ids if analysis_file_ids else None)
+                add_message(analysis_conversation_id, "user", user_msg, file_ids=analysis_file_ids if analysis_file_ids else None)
                 
                 yield f"data: {json.dumps({'type': 'routing', 'strategy': 'data_analysis_flow', 'label': 'investor', 'confidence': 1.0})}\n\n"
                 
-                # Stream response from analysis thread
-                for chunk in run_assistant_stream(analysis_thread_id, assistant_id):
+                # Stream response from analysis conversation
+                for chunk in run_assistant_stream(analysis_conversation_id, response_id):  # conversation_id is used as conversation_id, response_id is response_config_id
                     chunk["routing"] = {"strategy": "data_analysis_flow", "label": "investor"}
                     yield f"data: {json.dumps(chunk)}\n\n"
                     
@@ -861,34 +875,34 @@ async def chat_stream(
             
             # Files already uploaded above (plus any from product card)
             
-            primary_assistant_id, _ = get_assistant_ids(label)
-            reviewer_assistant_id, _ = get_assistant_ids(top2_label)
+            primary_response_id, _ = get_response_ids(label)
+            reviewer_response_id, _ = get_response_ids(top2_label)
             
-            if not primary_assistant_id:
-                error_msg = f"Assistant '{label}' not found. Run: python scripts/seed_multi_assistants.py"
+            if not primary_response_id:
+                error_msg = f"Response '{label}' not found. Run: python scripts/seed_multi_responses.py"
                 yield f"data: {json.dumps({'type': 'error', 'error': error_msg})}\n\n"
                 return
             
             # Strategy 1: Winner-take-all (confidence >= 0.8)
             if confidence >= 0.8:
-                thread_id = _get_or_create_thread(label)
+                conversation_id = _get_or_create_conversation(label)
                 
-                # If no new files but user is asking about data, re-attach previous files from this thread
+                # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not final_file_ids and detect_data_reference(user_msg):
-                    previous_files = get_thread_files(thread_id)
+                    previous_files = get_conversation_files(conversation_id)
                     if previous_files:
                         final_file_ids = previous_files
                 
-                # Track files uploaded to this thread
+                # Track files uploaded to this conversation
                 if final_file_ids:
-                    track_thread_files(thread_id, final_file_ids)
+                    track_conversation_files(conversation_id, final_file_ids)
                 
-                add_message(thread_id, "user", final_message, file_ids=final_file_ids if final_file_ids else None)
+                add_message(conversation_id, "user", final_message, file_ids=final_file_ids if final_file_ids else None)
                 
                 yield f"data: {json.dumps({'type': 'routing', 'strategy': 'winner_take_all', 'label': label, 'confidence': confidence})}\n\n"
                 
                 # Stream primary response
-                for chunk in run_assistant_stream(thread_id, primary_assistant_id):
+                for chunk in run_assistant_stream(conversation_id, primary_response_id):  # conversation_id is used as conversation_id, response_id is response_config_id
                     chunk["routing"] = routing
                     yield f"data: {json.dumps(chunk)}\n\n"
                     
@@ -900,7 +914,7 @@ async def chat_stream(
             
             # Strategy 2: Consult-then-decide (0.5 <= confidence < 0.8 OR high-risk)
             elif (0.5 <= confidence < 0.8) or is_high_risk:
-                if not reviewer_assistant_id:
+                if not reviewer_response_id:
                     # Fallback to primary only
                     thread_id = _get_or_create_thread(label)
                     
@@ -918,7 +932,7 @@ async def chat_stream(
                     
                     yield f"data: {json.dumps({'type': 'routing', 'strategy': 'winner_take_all', 'label': label, 'confidence': confidence})}\n\n"
                     
-                    for chunk in run_assistant_stream(thread_id, primary_assistant_id):
+                    for chunk in run_assistant_stream(thread_id, primary_response_id):  # In Responses API, thread_id and response_id are the same
                         chunk["routing"] = routing
                         yield f"data: {json.dumps(chunk)}\n\n"
                         
@@ -929,26 +943,26 @@ async def chat_stream(
                                 track_produced_files(session_id, image_file_ids)
                 else:
                     # Stream primary first
-                    thread_id_primary = _get_or_create_thread(label)
+                    conversation_id_primary = _get_or_create_conversation(label)
                     
-                    # If no new files but user is asking about data, re-attach previous files from this thread
+                    # If no new files but user is asking about data, re-attach previous files from this conversation
                     if not final_file_ids and detect_data_reference(user_msg):
-                        previous_files = get_thread_files(thread_id_primary)
+                        previous_files = get_conversation_files(conversation_id_primary)
                         if previous_files:
                             final_file_ids = previous_files
                     
-                    # Track files uploaded to this thread
+                    # Track files uploaded to this conversation
                     if final_file_ids:
-                        track_thread_files(thread_id_primary, final_file_ids)
+                        track_conversation_files(conversation_id_primary, final_file_ids)
                     
-                    add_message(thread_id_primary, "user", final_message, file_ids=final_file_ids if final_file_ids else None)
+                    add_message(conversation_id_primary, "user", final_message, file_ids=final_file_ids if final_file_ids else None)
                     
                     yield f"data: {json.dumps({'type': 'routing', 'strategy': 'consult_then_decide', 'primary_label': label, 'reviewer_label': top2_label, 'confidence': confidence})}\n\n"
                     
                     # Stream primary response
                     primary_answer = ""
                     primary_bullets = []
-                    for chunk in run_assistant_stream(thread_id_primary, primary_assistant_id):
+                    for chunk in run_assistant_stream(conversation_id_primary, primary_response_id):  # conversation_id is used as conversation_id, response_id is response_config_id
                         if chunk.get("type") == "text_delta":
                             primary_answer = chunk.get("accumulated", "")
                         elif chunk.get("type") == "done":
@@ -967,7 +981,7 @@ async def chat_stream(
                     yield f"data: {json.dumps({'type': 'phase_transition', 'from': 'primary', 'to': 'reviewer'})}\n\n"
                     
                     # Then ask reviewer to critique
-                    thread_id_reviewer = _get_or_create_thread(top2_label)
+                    conversation_id_reviewer = _get_or_create_conversation(top2_label)
                     # Include product card in critique prompt if available
                     critique_context = ""
                     if product_card:
@@ -990,10 +1004,10 @@ Please provide a "Devil's Advocate" critique from a {top2_label} perspective. Sp
 
 Be constructive and specific. Focus on adding value, not just criticizing."""
                     
-                    add_message(thread_id_reviewer, "user", critique_prompt, file_ids=final_file_ids if final_file_ids else None)
+                    add_message(conversation_id_reviewer, "user", critique_prompt, file_ids=final_file_ids if final_file_ids else None)
                     
                     # Stream reviewer response
-                    for chunk in run_assistant_stream(thread_id_reviewer, reviewer_assistant_id):
+                    for chunk in run_assistant_stream(conversation_id_reviewer, reviewer_response_id):  # conversation_id is used as conversation_id, response_id is response_config_id
                         chunk["routing"] = routing
                         chunk["phase"] = "reviewer"
                         yield f"data: {json.dumps(chunk)}\n\n"
@@ -1006,7 +1020,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
             
             # Strategy 3: Parallel ensemble (confidence < 0.5 OR margin < 0.15)
             else:
-                if not reviewer_assistant_id:
+                if not reviewer_response_id:
                     # Fallback to primary only
                     thread_id = _get_or_create_thread(label)
                     
@@ -1024,7 +1038,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
                     
                     yield f"data: {json.dumps({'type': 'routing', 'strategy': 'winner_take_all', 'label': label, 'confidence': confidence})}\n\n"
                     
-                    for chunk in run_assistant_stream(thread_id, primary_assistant_id):
+                    for chunk in run_assistant_stream(thread_id, primary_response_id):  # In Responses API, thread_id and response_id are the same
                         chunk["routing"] = routing
                         yield f"data: {json.dumps(chunk)}\n\n"
                         
@@ -1052,7 +1066,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
                     yield f"data: {json.dumps({'type': 'routing', 'strategy': 'parallel_ensemble', 'primary_label': label, 'reviewer_label': top2_label, 'confidence': confidence})}\n\n"
                     
                     # Stream primary response
-                    for chunk in run_assistant_stream(thread_id_primary, primary_assistant_id):
+                    for chunk in run_assistant_stream(thread_id_primary, primary_response_id):  # In Responses API, thread_id and response_id are the same
                         chunk["routing"] = routing
                         chunk["phase"] = "primary"
                         yield f"data: {json.dumps(chunk)}\n\n"
@@ -1067,10 +1081,10 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
                     yield f"data: {json.dumps({'type': 'phase_transition', 'from': 'primary', 'to': 'reviewer'})}\n\n"
                     
                     # Stream reviewer response (independent answer)
-                    thread_id_reviewer = _get_or_create_thread(top2_label)
-                    add_message(thread_id_reviewer, "user", final_message, file_ids=final_file_ids if final_file_ids else None)
+                    conversation_id_reviewer = _get_or_create_conversation(top2_label)
+                    add_message(conversation_id_reviewer, "user", final_message, file_ids=final_file_ids if final_file_ids else None)
                     
-                    for chunk in run_assistant_stream(thread_id_reviewer, reviewer_assistant_id):
+                    for chunk in run_assistant_stream(conversation_id_reviewer, reviewer_response_id):  # conversation_id is used as conversation_id, response_id is response_config_id
                         chunk["routing"] = routing
                         chunk["phase"] = "reviewer"
                         yield f"data: {json.dumps(chunk)}\n\n"

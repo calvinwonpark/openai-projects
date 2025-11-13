@@ -1,0 +1,17 @@
+Metric,Target,Actual,Progress,Status
+Monthly Recurring Revenue (MRR),50000,42000,84%,Behind
+Customer Acquisition Cost (CAC),150,180,120%,Over Budget
+Lifetime Value (LTV),1200,1100,92%,Behind
+LTV:CAC Ratio,8.0,6.1,76%,Behind
+Monthly Active Users (MAU),5000,4800,96%,On Track
+Net Revenue Retention,110%,108%,98%,Behind
+Gross Margin,75%,72%,96%,Behind
+Burn Rate (Monthly),25000,28000,112%,Over Budget
+Runway (Months),12,10.7,89%,Behind
+Customer Churn Rate,3%,3.2%,107%,Over Target
+Net Promoter Score (NPS),50,45,90%,Behind
+Sales Cycle (Days),30,35,117%,Over Target
+Product-Market Fit Score,40,38,95%,Behind
+Employee Count,15,14,93%,Behind
+Deal Win Rate,25%,22%,88%,Behind
+

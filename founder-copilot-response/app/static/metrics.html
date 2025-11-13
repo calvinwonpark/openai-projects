@@ -1,0 +1,124 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1"/>
+  <title>FounderCopilot — Metrics</title>
+  <style>
+    body { font-family: ui-sans-serif, system-ui; margin: 24px; max-width: 1100px; }
+    h1 { margin-bottom: 8px; }
+    .grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 12px 0 24px; }
+    .card { border: 1px solid #ddd; border-radius: 12px; padding: 12px; }
+    .muted { color: #666; font-size: 12px; }
+    canvas { width: 100%; height: 300px; }
+    .row { display: grid; grid-template-columns: 1fr; gap: 16px; }
+    @media (min-width: 900px) {
+      .row { grid-template-columns: 1fr 1fr; }
+    }
+    .btn { padding: 8px 12px; border: 1px solid #aaa; background:#fafafa; border-radius: 8px; cursor: pointer; }
+  </style>
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4"></script>
+</head>
+<body>
+  <h1>FounderCopilot Metrics</h1>
+  <div class="muted">Token usage, latency, and errors (last 48 hours / 14 days).</div>
+
+  <div class="grid">
+    <div class="card"><div class="muted">Requests (14d)</div><div id="m_req" style="font-size:28px">–</div></div>
+    <div class="card"><div class="muted">Error rate</div><div id="m_err" style="font-size:28px">–</div></div>
+    <div class="card"><div class="muted">Latency avg / p95 (ms)</div><div id="m_lat" style="font-size:28px">–</div></div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <div class="muted">Requests per hour (48h)</div>
+      <canvas id="cReq"></canvas>
+    </div>
+    <div class="card">
+      <div class="muted">Tokens per hour (48h)</div>
+      <canvas id="cTok"></canvas>
+    </div>
+  </div>
+
+  <div class="row" style="margin-top:16px">
+    <div class="card">
+      <div class="muted">Avg latency per hour (48h)</div>
+      <canvas id="cLat"></canvas>
+    </div>
+    <div class="card">
+      <div class="muted">Daily totals (14d)</div>
+      <canvas id="cDaily"></canvas>
+    </div>
+  </div>
+
+  <div style="margin-top:16px">
+    <button id="reset" class="btn">Reset Metrics</button>
+  </div>
+
+<script>
+async function loadMetrics() {
+  const resp = await fetch('/api/metrics');
+  const data = await resp.json();
+
+  // Top tiles
+  const t = data.totals || {};
+  const lat = (t.latency_ms || {});
+  document.getElementById('m_req').textContent = (t.requests ?? 0).toLocaleString();
+  document.getElementById('m_err').textContent = `${(t.error_rate ?? 0).toFixed(2)}%`;
+  document.getElementById('m_lat').textContent = `${lat.avg ?? '–'} / ${lat.p95 ?? '–'}`;
+
+  // Hourly (48h)
+  const hourly = data.hourly || [];
+  const labelsH = hourly.map(x => (new Date(x.bucket_start_iso)).toLocaleString());
+  const reqH = hourly.map(x => x.req);
+  const tokH = hourly.map(x => x.total_tokens);
+  const latH = hourly.map(x => x.avg_latency_ms ?? null);
+
+  // Daily (14d)
+  const daily = data.daily || [];
+  const labelsD = daily.map(x => (new Date(x.bucket_start_iso)).toLocaleDateString());
+  const tokD = daily.map(x => x.total_tokens);
+  const reqD = daily.map(x => x.req);
+
+  // Charts
+  makeBar('cReq', labelsH, reqH, 'Requests / hour');
+  makeBar('cTok', labelsH, tokH, 'Tokens / hour');
+  makeLine('cLat', labelsH, latH, 'Avg latency (ms)');
+  makeBar('cDaily', labelsD, reqD, 'Requests / day');
+}
+
+function makeBar(id, labels, data, label) {
+  const ctx = document.getElementById(id).getContext('2d');
+  new Chart(ctx, {
+    type: 'bar',
+    data: { labels, datasets: [{ label, data }] },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } }
+    }
+  });
+}
+
+function makeLine(id, labels, data, label) {
+  const ctx = document.getElementById(id).getContext('2d');
+  new Chart(ctx, {
+    type: 'line',
+    data: { labels, datasets: [{ label, data, spanGaps: true, tension: 0.2 }] },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 12 } } }
+    }
+  });
+}
+
+document.getElementById('reset').onclick = async () => {
+  await fetch('/api/metrics/reset', { method: 'POST' });
+  location.reload();
+};
+
+loadMetrics();
+</script>
+</body>
+</html>
