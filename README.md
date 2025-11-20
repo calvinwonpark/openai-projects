@@ -28,3 +28,8 @@ Created a GPT-4o Vision golf strategy assistant that parses course images, detec
 Simple chatbot implementation using the Responses API with code interpreter support for data analysis and visualization. Demonstrates basic Responses API usage patterns including file uploads, container file handling, and image extraction.
 
 **OpenAI APIs Used:** Responses API, Code Interpreter (via Responses API)
+
+### TeachMe Live (Realtime API)
+Production-grade real-time voice tutoring application with bidirectional voice conversations, multilingual support (Korean/English), and intelligent translation mode. Features AI-powered Tutor Notes generation that demonstrates multi-agent orchestration by combining Realtime API with Responses API. Includes image upload for homework questions, natural backchannels, smart speech detection, and real-time study notes with key concepts, examples, common mistakes, and review topics.
+
+**OpenAI APIs Used:** Realtime API, Responses API (for Tutor Notes), GPT Realtime (gpt-realtime)

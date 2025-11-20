@@ -1,0 +1,17 @@
+services:
+  web:
+    build: .
+    container_name: teachme_live_web
+    env_file:
+      - .env
+    ports:
+      - "8012:8012"        # host:container
+    volumes:
+      - ./uploads:/app/uploads
+      - ./static:/app/static
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://localhost:8012/ || exit 1"]
+      interval: 15s
+      timeout: 3s
+      retries: 10
