@@ -15,6 +15,9 @@ const updateNotesBtn = document.getElementById("updateNotesBtn");
 
 // Map response_id -> kind ("tutor_notes" vs normal response)
 const responseKinds = {};
+// Track active response IDs
+let activeResponseIds = new Set();
+let pendingNotesRequest = false; // Flag to request notes after current response completes
 
 let pc = null;                  // RTCPeerConnection
 let dc = null;                  // RTCDataChannel
@@ -266,18 +269,15 @@ async function startRealtimeSession() {
       const msg = JSON.parse(event.data);
       handleServerEvent(msg);
     } catch (e) {
-      log("📨 DataChannel message: " + event.data);
+      // Non-JSON message, ignore
     }
   };
 
   pc.onicecandidate = (event) => {
-    if (event.candidate) {
-      log("ICE candidate generated.");
-    }
+    // ICE candidate generated (no need to log)
   };
 
   pc.onconnectionstatechange = () => {
-    log("RTCPeerConnection state: " + pc.connectionState);
     if (pc.connectionState === "connected") {
       setStatus("connected");
       log("✅ WebRTC connected. Start talking!");
@@ -286,13 +286,13 @@ async function startRealtimeSession() {
       pc.connectionState === "disconnected"
     ) {
       setStatus(pc.connectionState);
+      log("⚠️ Connection state: " + pc.connectionState);
     }
   };
 
   // 6) Create SDP offer
   const offer = await pc.createOffer();
   await pc.setLocalDescription(offer);
-  log("📃 Local SDP created.");
 
   // 7) Build initial session config
   const targetLang = getTargetLanguage();
@@ -309,7 +309,6 @@ async function startRealtimeSession() {
   fd.set("sdp", offer.sdp);
   fd.set("session", JSON.stringify(sessionConfig));
 
-  log("🔄 Sending offer to OpenAI /v1/realtime/calls…");
   const resp = await fetch(
     "https://api.openai.com/v1/realtime/calls?model=gpt-realtime",
     {
@@ -344,7 +343,6 @@ async function startRealtimeSession() {
     sdp: sdpText,
   });
 
-  log("✅ Remote SDP set. Realtime session established.");
   setStatus("connected");
 }
 
@@ -383,12 +381,6 @@ function sendSessionUpdate() {
 
   try {
     dc.send(JSON.stringify(evt));
-    log(
-      "📤 Sent session.update for language = " +
-        targetLang +
-        ", translatorMode = " +
-        translatorMode
-    );
   } catch (e) {
     log("❌ Failed to send session.update: " + e);
   }
@@ -398,6 +390,29 @@ function sendSessionUpdate() {
 // Tutor Notes Request
 // ------------------------------
 function requestTutorNotes() {
+  if (!dc || dc.readyState !== "open") {
+    log("⚠️ Cannot update notes: session not connected.");
+    return;
+  }
+
+  // Check if there's an active response
+  if (activeResponseIds.size > 0) {
+    log("⏳ Waiting for current response to complete before generating notes...");
+    pendingNotesRequest = true;
+    
+    // Add a timeout fallback - if no response completes in 10 seconds, clear and proceed
+    setTimeout(() => {
+      if (pendingNotesRequest && activeResponseIds.size > 0) {
+        log("⚠️ Timeout: Clearing stuck responses and proceeding with notes request...");
+        activeResponseIds.clear();
+        pendingNotesRequest = false;
+        requestTutorNotes();
+      }
+    }, 10000);
+    
+    return;
+  }
+
   const targetLang = getTargetLanguage();
   const translatorMode = isTranslatorMode ? isTranslatorMode() : false;
   // Build language-specific note style
@@ -410,11 +425,10 @@ function requestTutorNotes() {
         "Write concise study notes with bullet points. Include: (1) key concepts, (2) examples, (3) common mistakes, (4) suggested review topics. " +
         "Do NOT speak these aloud; just return text notes.";
 
+  // Create a response with text-only output item
   const evt = {
     type: "response.create",
     response: {
-      // We want text-only notes (no voice)
-      modalities: ["text"],
       // Mark this so we can route its output separately
       metadata: {
         topic: "tutor_notes",
@@ -427,7 +441,7 @@ function requestTutorNotes() {
     // Optionally clear previous notes so you see the latest version
     clearNotes();
     dc.send(JSON.stringify(evt));
-    log("📑 Requested Tutor Notes via response.create.");
+    log("📑 Requested Tutor Notes.");
   } catch (e) {
     log("❌ Failed to send tutor notes request: " + e);
   }
@@ -436,10 +450,6 @@ function requestTutorNotes() {
 // Wire the "Update Notes" button
 if (updateNotesBtn) {
   updateNotesBtn.addEventListener("click", () => {
-    if (!dc || dc.readyState !== "open") {
-      log("⚠️ Cannot update notes: session not connected.");
-      return;
-    }
     requestTutorNotes();
   });
 }
@@ -466,8 +476,7 @@ function sendImageToRealtime(dataUrl) {
 
   try {
     dc.send(JSON.stringify(evt));
-    log("📷 Sent input_image to Realtime model.");
-    log("Now you can ask: \"Can you explain the question in the image I uploaded?\"");
+    log("📷 Image sent to model. You can now ask questions about it.");
   } catch (e) {
     log("❌ Failed to send image: " + e);
   }
@@ -482,35 +491,126 @@ function handleServerEvent(msg) {
     // log("Item created: " + JSON.stringify(msg.item));
 
   } else if (msg.type === "response.created") {
-    // Tag this response as tutor notes if metadata says so
+    // Track active response
     const r = msg.response;
+    const responseId = r?.id || msg.response_id;
+    if (responseId) {
+      activeResponseIds.add(responseId);
+    }
+    
+    // Tag this response as tutor notes if metadata says so
     if (r && r.metadata && r.metadata.topic === "tutor_notes") {
-      responseKinds[r.id] = "tutor_notes";
-      log("📝 Tutor Notes response.created (id=" + r.id + ")");
+      responseKinds[responseId] = "tutor_notes";
+      // Also check if response has initial text
+      if (r.output && r.output.text) {
+        appendToNotes(r.output.text);
+      }
     }
 
-  } else if (msg.type === "response.output_text.delta") {
-    const kind = responseKinds[msg.response_id];
+  } else if (msg.type === "response.output_text.delta" || msg.type === "response.text.delta") {
+    const responseId = msg.response_id || msg.response?.id;
+    const kind = responseKinds[responseId];
+    
     if (kind === "tutor_notes") {
       if (msg.delta) {
         appendToNotes(msg.delta);
       }
-    } else {
-      // Normal model text stream
-      if (msg.delta) {
-        log("🧠 MODEL (delta): " + msg.delta);
+    }
+    
+  } else if (msg.type === "response.output_audio_transcript.delta" || msg.type === "response.audio_transcript.delta") {
+    // Intercept audio transcript for tutor notes - extract text from what's being spoken
+    const responseId = msg.response_id || msg.response?.id;
+    const kind = responseKinds[responseId];
+    
+    if (kind === "tutor_notes") {
+      // Extract text from audio transcript delta
+      const transcript = msg.delta || msg.transcript || msg.text || msg.content;
+      if (transcript) {
+        appendToNotes(transcript);
+      }
+    }
+    
+  } else if (msg.type === "response.output_audio_transcript.done" || msg.type === "response.audio_transcript.done") {
+    // Full audio transcript completed - extract for tutor notes
+    const responseId = msg.response_id || msg.response?.id;
+    const kind = responseKinds[responseId];
+    
+    if (kind === "tutor_notes") {
+      // Extract full transcript - check multiple locations
+      const transcript = msg.transcript || msg.text || msg.content || (msg.response && msg.response.transcript);
+      if (transcript) {
+        appendToNotes(transcript);
       }
     }
 
   } else if (msg.type === "response.done" || msg.type === "response.completed") {
-    // Response finished
-    const kind = responseKinds[msg.response_id];
-    if (kind === "tutor_notes") {
-      log("✅ Tutor Notes generation completed.");
+    // Response finished - remove from active set
+    const responseId = msg.response_id || msg.response?.id || msg.id;
+    if (responseId) {
+      activeResponseIds.delete(responseId);
     } else {
-      log("✅ MODEL response completed.");
-      // OPTIONAL: auto-refresh notes after each normal response:
-      // requestTutorNotes();
+      // If no response_id, clear all active responses (fallback)
+      activeResponseIds.clear();
+    }
+    
+    const kind = responseKinds[responseId];
+    if (kind === "tutor_notes") {
+      // Check if the response contains text that we might have missed
+      const response = msg.response || msg;
+      
+      // Check response.output array for content with transcript (audio output)
+      if (response.output && Array.isArray(response.output)) {
+        for (const outputItem of response.output) {
+          if (outputItem.content && Array.isArray(outputItem.content)) {
+            for (const contentItem of outputItem.content) {
+              // Check for transcript in output_audio content
+              if (contentItem.type === "output_audio" && contentItem.transcript) {
+                appendToNotes(contentItem.transcript);
+              }
+              // Check for text content
+              if (contentItem.type === "text" && contentItem.text) {
+                appendToNotes(contentItem.text);
+              }
+              // Also check if transcript is directly in contentItem
+              if (contentItem.transcript && contentItem.type !== "output_audio") {
+                appendToNotes(contentItem.transcript);
+              }
+            }
+          }
+        }
+      }
+      
+      // Check for text in output (legacy format)
+      if (response.output && response.output.text) {
+        appendToNotes(response.output.text);
+      }
+      
+      // Check for items array
+      if (response.output && response.output.items && Array.isArray(response.output.items)) {
+        for (const item of response.output.items) {
+          if (item.text) {
+            appendToNotes(item.text);
+          }
+        }
+      }
+      
+      // Check for text directly in the message
+      if (response.text) {
+        appendToNotes(response.text);
+      }
+      
+      if (msg.text) {
+        appendToNotes(msg.text);
+      }
+    }
+    
+    // If there was a pending notes request, process it now
+    if (pendingNotesRequest && activeResponseIds.size === 0) {
+      pendingNotesRequest = false;
+      // Small delay to ensure everything is cleaned up
+      setTimeout(() => {
+        requestTutorNotes();
+      }, 100);
     }
 
   } else if (msg.type === "input_audio_buffer.speech_started") {
@@ -532,11 +632,24 @@ function handleServerEvent(msg) {
       speechStopTimeout = null;
     }, SPEECH_STOP_DELAY_MS);
   } else if (msg.type === "session.updated") {
-    log("ℹ️ Session updated.");
+    // Session updated (no need to log)
   } else if (msg.type === "error") {
     log("❌ Realtime error: " + JSON.stringify(msg));
-  } else {
-    // Uncomment for full debugging:
-    // log("Event: " + JSON.stringify(msg));
+  } else if (msg.type && msg.type.includes("response") && msg.type.includes("text")) {
+    // Handle any response text events
+    const responseId = msg.response_id || msg.response?.id;
+    if (msg.delta) {
+      const kind = responseKinds[responseId];
+      if (kind === "tutor_notes") {
+        appendToNotes(msg.delta);
+      }
+    }
+    // Also check for full text in the message
+    if (msg.text) {
+      const kind = responseKinds[responseId];
+      if (kind === "tutor_notes") {
+        appendToNotes(msg.text);
+      }
+    }
   }
 }
