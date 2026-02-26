@@ -1362,6 +1362,34 @@ def _parse_response_stream_event(event, accumulated_text: str = "") -> Optional[
         event_type = event.__dict__["type"]
     
     # Handle different event types
+    # Newer SDKs emit response.output_text.* events directly.
+    if event_type == "response.output_text.delta":
+        delta_text = None
+        if hasattr(event, "delta"):
+            delta = event.delta
+            if isinstance(delta, str):
+                delta_text = delta
+            elif hasattr(delta, "text"):
+                delta_text = delta.text
+            elif isinstance(delta, dict):
+                delta_text = delta.get("text") or delta.get("value")
+        elif isinstance(event, dict):
+            delta = event.get("delta")
+            if isinstance(delta, str):
+                delta_text = delta
+            elif isinstance(delta, dict):
+                delta_text = delta.get("text") or delta.get("value")
+
+        if delta_text:
+            return {
+                "type": "text_delta",
+                "content": str(delta_text),
+            }
+
+    elif event_type == "response.output_text.done":
+        # Keep stream open for final response.completed event; no-op here.
+        return None
+
     if event_type == "response.output_item.added":
         # New output item was added - extract text from item
         item = None

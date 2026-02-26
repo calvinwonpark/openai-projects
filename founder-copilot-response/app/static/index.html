@@ -754,8 +754,8 @@
         formData.append('files', file);
       });
 
-      // Use non-streaming endpoint to verify response formatting
-      const response = await fetch('/chat', {
+      // Use streaming endpoint (SSE)
+      const response = await fetch('/chat/stream', {
         method: 'POST',
         body: formData
       });
@@ -778,46 +778,6 @@
         throw new Error(errorMessage);
       }
 
-      const data = await response.json();
-      
-      // Process the non-streaming response
-      if (data.error) {
-        // Handle error
-        if (contentDiv) {
-          contentDiv.className = 'message-content';
-          loadingMsg.classList.remove('loading');
-          contentDiv.innerHTML = `<div style="color: #d32f2f; padding: 12px; background: #ffebee; border-radius: 8px; border-left: 4px solid #d32f2f;">
-            <strong>Error:</strong> ${escapeHtml(data.error)}
-          </div>`;
-        }
-        sendBtn.disabled = false;
-        msgInput.focus();
-        return;
-      }
-      
-      // Extract data from response
-      finalStructuredData = {
-        answer: data.answer || '',
-        bullets: data.bullets || null,
-        sources: data.sources || [],
-        images: data.images || []
-      };
-      
-      // Update the message with structured data
-      loadingMsg.classList.remove('loading');
-      // Make sure the contentDiv has the right class
-      const contentDivToUpdate = loadingMsg.querySelector('.loading') || loadingMsg.querySelector('.message-content');
-      if (contentDivToUpdate) {
-        contentDivToUpdate.className = 'message-content';
-      }
-      updateMessageWithStructuredData(loadingMsg, finalStructuredData);
-      
-      sendBtn.disabled = false;
-      msgInput.focus();
-      return;
-      
-      // OLD STREAMING CODE (commented out for now)
-      /*
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
       let buffer = '';
@@ -1066,10 +1026,6 @@
       
       // Finalize the message with structured data
       if (finalStructuredData.answer || finalAccumulatedText) {
-        // Use final structured data if available, otherwise use accumulated text
-        if (!finalStructuredData.answer && finalAccumulatedText) {
-          finalStructuredData.answer = finalAccumulatedText;
-        }
         // Ensure sources and images arrays are initialized
         if (!finalStructuredData.sources) {
           finalStructuredData.sources = [];
@@ -1077,14 +1033,24 @@
         if (!finalStructuredData.images) {
           finalStructuredData.images = [];
         }
-        // Update the message with all structured data (answer, bullets, sources, images)
-        updateMessageWithStructuredData(loadingMsg, finalStructuredData);
+
+        // Keep one continuous streamed block: avoid full re-render after streaming started.
+        if (hasStartedStreaming && contentDiv) {
+          const stableText = finalAccumulatedText || finalStructuredData.answer || '';
+          contentDiv.className = 'message-content';
+          contentDiv.innerHTML = `<div>${formatStreamingText(stableText)}</div>`;
+          appendStructuredExtras(loadingMsg, finalStructuredData);
+        } else {
+          // Non-stream fallback
+          if (!finalStructuredData.answer && finalAccumulatedText) {
+            finalStructuredData.answer = finalAccumulatedText;
+          }
+          updateMessageWithStructuredData(loadingMsg, finalStructuredData);
+        }
       } else if (contentDiv) {
         // If no structured data, at least ensure contentDiv has the right class
         contentDiv.className = 'message-content';
       }
-      */
-      
     } catch (error) {
       console.error('Request error:', error);
       // Only remove loading message if it still exists and hasn't been updated
@@ -1212,6 +1178,63 @@
       
       // Append sources to contentDiv, not msgElement
       contentDiv.insertAdjacentHTML('beforeend', html);
+    }
+  }
+
+  function appendStructuredExtras(msgElement, structuredData) {
+    let contentDiv = msgElement.querySelector('.message-content');
+    if (!contentDiv) return;
+
+    // Remove previous extras to avoid duplicates on retries/re-renders.
+    const existingSources = msgElement.querySelectorAll('.sources');
+    existingSources.forEach(el => el.remove());
+    const existingImages = msgElement.querySelectorAll('.images-container');
+    existingImages.forEach(el => el.remove());
+    const existingBullets = msgElement.querySelectorAll('.bullets');
+    existingBullets.forEach(el => el.remove());
+
+    // Append bullets if present
+    if (structuredData.bullets && Array.isArray(structuredData.bullets) && structuredData.bullets.length > 0) {
+      let bulletsHtml = '<ul class="bullets">';
+      structuredData.bullets.forEach((bullet) => {
+        let cleanBullet = (bullet || '').replace(/【[^】]+】/g, '').trim();
+        if (cleanBullet) {
+          bulletsHtml += `<li>${escapeHtml(cleanBullet).replace(/\n/g, '<br>')}</li>`;
+        }
+      });
+      bulletsHtml += '</ul>';
+      contentDiv.insertAdjacentHTML('beforeend', bulletsHtml);
+    }
+
+    // Append images if present
+    if (structuredData.images && Array.isArray(structuredData.images) && structuredData.images.length > 0) {
+      let imagesHtml = '<div class="images-container" style="margin: 16px 0;">';
+      structuredData.images.forEach((image, index) => {
+        if (image.url) {
+          imagesHtml += `<div class="chart-image" style="margin-bottom: 12px;">`;
+          imagesHtml += `<img src="${escapeHtml(image.url)}" alt="Chart ${index + 1}" style="max-width: 100%; height: auto; border-radius: 8px; box-shadow: 0 2px 8px rgba(0,0,0,0.1);" />`;
+          imagesHtml += `</div>`;
+        }
+      });
+      imagesHtml += '</div>';
+      contentDiv.insertAdjacentHTML('beforeend', imagesHtml);
+    }
+
+    // Append sources if present
+    if (structuredData.sources && Array.isArray(structuredData.sources) && structuredData.sources.length > 0) {
+      let sourcesHtml = '<div class="sources">';
+      sourcesHtml += `<div class="sources-title">📚 Sources <span class="citation-badge">${structuredData.sources.length}</span></div>`;
+      structuredData.sources.forEach((source) => {
+        sourcesHtml += '<div class="source-item">';
+        const displayName = source.filename || source.file_id || 'Unknown Source';
+        sourcesHtml += `<div class="source-filename">${escapeHtml(displayName)}</div>`;
+        if (source.quote && source.quote.trim()) {
+          sourcesHtml += `<div class="source-quote">"${escapeHtml(source.quote)}"</div>`;
+        }
+        sourcesHtml += '</div>';
+      });
+      sourcesHtml += '</div>';
+      contentDiv.insertAdjacentHTML('beforeend', sourcesHtml);
     }
   }
 
