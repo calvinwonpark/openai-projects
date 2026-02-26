@@ -1,0 +1,84 @@
+name: gpt-eval-kit-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  offline-evals:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - routing_core
+          - tool_use
+          - rag_core
+          - safety_refusal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          cd gpt-eval-kit
+          pip install -e .
+      - name: Offline eval + baseline diff
+        run: |
+          cd gpt-eval-kit
+          evalkit run --suite "cases/suites/${{ matrix.suite }}.jsonl" --mode offline --baseline "baselines/${{ matrix.suite }}"
+
+  online-openai-evals:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name != 'workflow_dispatch' && secrets.OPENAI_API_KEY != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false) }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - routing_core
+          - safety_refusal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          cd gpt-eval-kit
+          pip install -e .
+      - name: Online eval (OpenAI)
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: gpt-4o-mini
+        run: |
+          cd gpt-eval-kit
+          evalkit run --suite "cases/suites/${{ matrix.suite }}.jsonl" --mode openai --baseline "baselines/${{ matrix.suite }}"
+
+  update-baselines:
+    runs-on: ubuntu-latest
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        suite:
+          - routing_core
+          - tool_use
+          - rag_core
+          - safety_refusal
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install
+        run: |
+          cd gpt-eval-kit
+          pip install -e .
+      - name: Update baseline summaries (manual)
+        run: |
+          cd gpt-eval-kit
+          evalkit run --suite "cases/suites/${{ matrix.suite }}.jsonl" --mode offline --baseline "baselines/${{ matrix.suite }}" --update-baseline

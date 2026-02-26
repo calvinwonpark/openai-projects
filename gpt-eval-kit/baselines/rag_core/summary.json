@@ -1,0 +1,55 @@
+{
+  "generated_at": "2026-02-26T18:56:16.837087+00:00",
+  "dataset": "cases/suites/rag_core.jsonl",
+  "suite_name": "rag_core",
+  "metrics": {
+    "non_refusal_overall": {
+      "count": 2,
+      "latency_ms_p50": 0.0,
+      "latency_ms_p95": 0.0,
+      "cost_usd_mean": 8.2e-05,
+      "cost_usd_p95": 8.2e-05,
+      "tokens_total_mean": 170.0,
+      "tokens_total_p95": 170.0
+    },
+    "non_refusal_by_route": {
+      "tech": {
+        "count": 0,
+        "latency_ms_p50": null,
+        "latency_ms_p95": null,
+        "cost_usd_mean": null,
+        "cost_usd_p95": null,
+        "tokens_total_mean": null,
+        "tokens_total_p95": null
+      },
+      "marketing": {
+        "count": 0,
+        "latency_ms_p50": null,
+        "latency_ms_p95": null,
+        "cost_usd_mean": null,
+        "cost_usd_p95": null,
+        "tokens_total_mean": null,
+        "tokens_total_p95": null
+      },
+      "investor": {
+        "count": 0,
+        "latency_ms_p50": null,
+        "latency_ms_p95": null,
+        "cost_usd_mean": null,
+        "cost_usd_p95": null,
+        "tokens_total_mean": null,
+        "tokens_total_p95": null
+      }
+    },
+    "refusal_overall": {
+      "count": 1,
+      "latency_ms_mean": 0.0,
+      "cost_usd_mean": 8.2e-05
+    },
+    "confusion_matrix": {
+      "support": {
+        "support": 3
+      }
+    }
+  }
+}

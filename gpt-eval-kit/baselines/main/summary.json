@@ -1,0 +1,60 @@
+{
+  "generated_at": "2026-02-26T00:00:00+00:00",
+  "dataset": "cases/suites/routing_core.jsonl",
+  "metrics": {
+    "non_refusal_overall": {
+      "count": 3,
+      "latency_ms_p50": 220.0,
+      "latency_ms_p95": 300.0,
+      "cost_usd_mean": 0.00014,
+      "cost_usd_p95": 0.0002,
+      "tokens_total_mean": 175.0,
+      "tokens_total_p95": 220.0
+    },
+    "non_refusal_by_route": {
+      "tech": {
+        "count": 1,
+        "latency_ms_p50": 260.0,
+        "latency_ms_p95": 260.0,
+        "cost_usd_mean": 0.0002,
+        "cost_usd_p95": 0.0002,
+        "tokens_total_mean": 220.0,
+        "tokens_total_p95": 220.0
+      },
+      "marketing": {
+        "count": 1,
+        "latency_ms_p50": 210.0,
+        "latency_ms_p95": 210.0,
+        "cost_usd_mean": 0.0001,
+        "cost_usd_p95": 0.0001,
+        "tokens_total_mean": 160.0,
+        "tokens_total_p95": 160.0
+      },
+      "investor": {
+        "count": 1,
+        "latency_ms_p50": 230.0,
+        "latency_ms_p95": 230.0,
+        "cost_usd_mean": 0.00012,
+        "cost_usd_p95": 0.00012,
+        "tokens_total_mean": 145.0,
+        "tokens_total_p95": 145.0
+      }
+    },
+    "refusal_overall": {
+      "count": 0,
+      "latency_ms_mean": null,
+      "cost_usd_mean": null
+    },
+    "confusion_matrix": {
+      "marketing": {
+        "marketing": 1
+      },
+      "tech": {
+        "tech": 1
+      },
+      "investor": {
+        "investor": 1
+      }
+    }
+  }
+}
