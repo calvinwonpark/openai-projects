@@ -27,8 +27,36 @@ import mimetypes
 import time
 from openai import OpenAI
 from typing import Dict, Any, List, Generator, Optional
+from app.tool_schema import validate_tool_args, schema_error_log
 
 _client = None
+_SCHEMA_VIOLATIONS = 0
+
+
+def get_schema_violation_count() -> int:
+    return _SCHEMA_VIOLATIONS
+
+
+def _record_schema_violation(tool_name: str, error: str) -> None:
+    global _SCHEMA_VIOLATIONS
+    _SCHEMA_VIOLATIONS += 1
+    print(schema_error_log(tool_name, error), flush=True)
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return isinstance(exc, TimeoutError) or "timeout" in text or "timed out" in text
+
+
+def _is_retryable_tool_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return (
+        _is_timeout_error(exc)
+        or "tool" in text
+        or "rate limit" in text
+        or "temporar" in text
+        or "connection" in text
+    )
 
 def get_client():
     global _client
@@ -583,6 +611,21 @@ def run_response(
                 "file_ids": all_file_ids
             }
         }]
+
+    # Validate tool arguments against JSON Schema before any tool execution.
+    if "tools" in response_params:
+        schema_ok, schema_error = validate_tool_args(response_params["tools"])
+        if not schema_ok:
+            _record_schema_violation("workflow_tools", schema_error)
+            yield {
+                "type": "error",
+                "error": "TOOL_SCHEMA_VALIDATION_ERROR",
+                "schema_valid": False,
+                "tool_name": "workflow_tools",
+                "details": schema_error,
+                "failure_mode": "schema_validation",
+            }
+            return
     
     # Use Responses API
     # Try responses first, then beta.responses (depending on SDK version)
@@ -590,9 +633,32 @@ def run_response(
         # Add stream parameter if streaming
         if stream:
             response_params["stream"] = True
-        
-        # Create response (executes immediately, streams if stream=True)
-        response = client.responses.create(**response_params)
+        response = None
+        for attempt in range(2):
+            try:
+                response = client.responses.create(**response_params)
+                break
+            except Exception as e:
+                if attempt == 0 and _is_retryable_tool_error(e):
+                    continue
+                if _is_timeout_error(e):
+                    yield {
+                        "type": "done",
+                        "answer": "",
+                        "sources": [],
+                        "images": [],
+                        "usage": {},
+                        "warning": "tool_timeout",
+                        "partial": True,
+                        "failure_mode": "timeout",
+                    }
+                    return
+                yield {
+                    "type": "error",
+                    "error": f"Tool execution failed after retry: {str(e)}",
+                    "failure_mode": "tool_failure",
+                }
+                return
         
         if stream:
             # Streaming: iterate over response stream
@@ -726,8 +792,32 @@ def run_response(
         # Try beta.responses
         if stream:
             response_params["stream"] = True
-        
-        response = client.beta.responses.create(**response_params)
+        response = None
+        for attempt in range(2):
+            try:
+                response = client.beta.responses.create(**response_params)
+                break
+            except Exception as e:
+                if attempt == 0 and _is_retryable_tool_error(e):
+                    continue
+                if _is_timeout_error(e):
+                    yield {
+                        "type": "done",
+                        "answer": "",
+                        "sources": [],
+                        "images": [],
+                        "usage": {},
+                        "warning": "tool_timeout",
+                        "partial": True,
+                        "failure_mode": "timeout",
+                    }
+                    return
+                yield {
+                    "type": "error",
+                    "error": f"Tool execution failed after retry: {str(e)}",
+                    "failure_mode": "tool_failure",
+                }
+                return
         
         if stream:
             # Streaming: iterate over response stream
@@ -2217,7 +2307,7 @@ def add_message(thread_id: str, role: str, content: str, file_ids: Optional[List
     """
     return add_message_to_response(thread_id, role, content, file_ids)
 
-def run_assistant_structured(thread_id: str, assistant_id: str) -> Dict[str, Any]:
+def run_assistant_structured(thread_id: str, assistant_id: str, tools_override: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """
     Legacy function - maps to run_response.
     In Responses API:
@@ -2233,14 +2323,35 @@ def run_assistant_structured(thread_id: str, assistant_id: str) -> Dict[str, Any
         raise ValueError(f"Response config not found: {response_config_id}")
     
     result = None
+    run_meta: Dict[str, Any] = {
+        "failed": False,
+        "warning": None,
+        "partial": False,
+        "failure_mode": None,
+        "error": None,
+    }
+    selected_tools = tools_override if tools_override is not None else config.get("tools")
+
     for chunk in run_response(
         conversation_id=conversation_id,
         response_config_id=response_config_id,
         stream=False,
         instructions=config.get("instructions"),
-        tools=config.get("tools")
+        tools=selected_tools
     ):
         result = chunk
+        chunk_type = chunk.get("type")
+        if chunk_type == "error":
+            run_meta["failed"] = True
+            run_meta["error"] = chunk.get("error")
+            run_meta["failure_mode"] = chunk.get("failure_mode")
+        elif chunk_type == "done":
+            if chunk.get("warning"):
+                run_meta["warning"] = chunk.get("warning")
+            if chunk.get("partial"):
+                run_meta["partial"] = True
+            if chunk.get("failure_mode"):
+                run_meta["failure_mode"] = chunk.get("failure_mode")
     
     if not result:
         return {
@@ -2249,7 +2360,14 @@ def run_assistant_structured(thread_id: str, assistant_id: str) -> Dict[str, Any
             "raw_text": "",
             "bullets": None,
             "images": [],
-            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+            "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0},
+            "run_meta": {
+                "failed": True,
+                "warning": "empty_result",
+                "partial": True,
+                "failure_mode": "empty_result",
+                "error": "No result returned from run_response",
+            },
         }
     
     # Extract structured data from response
@@ -2323,6 +2441,7 @@ def run_assistant_structured(thread_id: str, assistant_id: str) -> Dict[str, Any
     payload["usage"] = usage
     if image_data:
         payload["images"] = image_data
+    payload["run_meta"] = run_meta
     
     return payload
 

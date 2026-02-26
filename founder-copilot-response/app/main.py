@@ -1,18 +1,22 @@
 import os
 import time
 import json
+from datetime import datetime, timezone
 from fastapi import FastAPI, Request, Depends, UploadFile, File, Form
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import JSONResponse, FileResponse, StreamingResponse, Response
-from typing import List, Optional
+from typing import List, Optional, Dict, Any
 from dotenv import load_dotenv
+from pydantic import BaseModel
 
-from app.openai_client import create_thread, add_message, run_assistant_structured, run_assistant_stream, upload_file, download_file_bytes, download_container_file_bytes
+from app.openai_client import create_thread, add_message, run_assistant_structured, run_assistant_stream, upload_file, download_file_bytes, download_container_file_bytes, get_response_config
+from app.openai_client import get_schema_violation_count
 from app.storage import get_ids, get_response_ids, get_all_response_ids
 # Note: create_thread, run_assistant_structured, run_assistant_stream are compatibility wrappers
 # that map to Responses API functions (create_conversation, run_response, etc.)
-from app.router import route_query
+from app.router import route_query, heuristic_classify, is_high_risk
 from app.metrics import metrics
+from app.tool_schema import validate_tool_args, tool_count, tool_names, schema_error_payload
 from app.product_card import (
     get_product_card, get_all_product_cards, create_or_update_product_card,
     detect_deictic_references, rewrite_message_with_product_card,
@@ -36,6 +40,9 @@ SESSION_PRODUCED_FILES = {}  # Track files produced in previous turns per sessio
 CONVERSATION_UPLOADED_FILES = {}  # Track files uploaded to each conversation: {conversation_id: [file_ids]}
 SESSION_ANALYSIS_CONVERSATION = {}  # Shared analysis conversation for data flows (CSV/analysis iterations): {session_id: conversation_id}
 SESSION_ANALYSIS_FILES = {}  # Track files in the shared analysis conversation: {session_id: [file_ids]}
+ENTERPRISE_METRICS = {
+    "schema_violations": 0,
+}
 
 # Legacy aliases for backward compatibility (deprecated - use CONVERSATIONS instead)
 RESPONSES = CONVERSATIONS
@@ -60,6 +67,84 @@ async def get_session_id(req: Request) -> str:
     """Get session identifier (using IP for now, could use session cookie)."""
     ip = await client_ip(req)
     return ip if ip else "default"
+
+
+def _estimate_cost_usd(input_tokens: int, output_tokens: int, model: str = None) -> float:
+    # Simple model-agnostic estimate for telemetry (template value, not billing source-of-truth).
+    in_rate_per_million = 5.0
+    out_rate_per_million = 15.0
+    model_name = (model or os.getenv("OPENAI_MODEL", "gpt-4o")).lower()
+    if "mini" in model_name:
+        in_rate_per_million = 0.2
+        out_rate_per_million = 0.6
+    return round((input_tokens / 1_000_000) * in_rate_per_million + (output_tokens / 1_000_000) * out_rate_per_million, 6)
+
+
+def _log_workflow_telemetry(
+    workflow: str,
+    tenant_id: str,
+    route: str,
+    latency_ms: float,
+    tool_calls: int,
+    tool_success: bool,
+    schema_valid: bool,
+    input_tokens: int,
+    output_tokens: int,
+    warning: Optional[str] = None,
+):
+    payload = {
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "workflow": workflow,
+        "tenant_id": tenant_id,
+        "route": route,
+        "latency_ms": round(latency_ms, 2),
+        "tool_calls": tool_calls,
+        "tool_success": tool_success,
+        "schema_valid": schema_valid,
+        "tokens": {"input": input_tokens, "output": output_tokens},
+        "cost_estimate_usd": _estimate_cost_usd(input_tokens, output_tokens, os.getenv("OPENAI_MODEL", "gpt-4o")),
+    }
+    if warning:
+        payload["warning"] = warning
+    print(
+        json.dumps(
+            payload,
+            ensure_ascii=False,
+        ),
+        flush=True,
+    )
+
+
+def _deterministic_route(query: str) -> dict:
+    label, confidence = heuristic_classify(query)
+    fallback_top2 = "marketing" if label != "marketing" else "tech"
+    return {
+        "label": label,
+        "confidence": confidence,
+        "top2_label": fallback_top2,
+        "margin": max(0.0, min(1.0, confidence - 0.2)),
+        "is_high_risk": is_high_risk(query),
+    }
+
+
+def _should_refuse(message: str) -> bool:
+    m = (message or "").lower()
+    refusal_markers = ["malware", "exploit", "fraud", "illegal", "weapon", "violence", "violent", "extortion"]
+    return any(k in m for k in refusal_markers)
+
+
+def _tenant_scope_key(tenant_id: str, key: str) -> str:
+    return f"{tenant_id}:{key}"
+
+
+def _resolve_tools_for_response(response_id: Optional[str], tools_override: Optional[List[Dict[str, Any]]]) -> List[Dict[str, Any]]:
+    if tools_override is not None:
+        return tools_override
+    if not response_id:
+        return []
+    cfg = get_response_config(response_id) or {}
+    tools = cfg.get("tools")
+    return tools if isinstance(tools, list) else []
 
 def get_active_product_id(session_id: str) -> Optional[str]:
     """Get active product ID for session."""
@@ -133,31 +218,86 @@ def is_data_analysis_flow(user_message: str, has_files: bool) -> bool:
     # If user uploaded files (CSV, Excel) or is asking about data analysis, it's a data flow
     return has_files or (has_analysis_keywords and detect_data_reference(user_message))
 
-def get_or_create_analysis_conversation(session_id: str) -> str:
+def get_or_create_analysis_conversation(session_id: str, tenant_id: str = "default") -> str:
     """Get or create a shared analysis conversation for data flows."""
-    if session_id not in SESSION_ANALYSIS_CONVERSATION:
+    scoped = _tenant_scope_key(tenant_id, session_id)
+    if scoped not in SESSION_ANALYSIS_CONVERSATION:
         conversation = create_thread()  # create_thread creates a conversation in Responses API
-        SESSION_ANALYSIS_CONVERSATION[session_id] = conversation.id
-    return SESSION_ANALYSIS_CONVERSATION[session_id]
+        SESSION_ANALYSIS_CONVERSATION[scoped] = conversation.id
+    return SESSION_ANALYSIS_CONVERSATION[scoped]
 
-def track_analysis_files(session_id: str, file_ids: List[str]):
+def track_analysis_files(session_id: str, file_ids: List[str], tenant_id: str = "default"):
     """Track files in the shared analysis conversation."""
-    if session_id not in SESSION_ANALYSIS_FILES:
-        SESSION_ANALYSIS_FILES[session_id] = []
-    existing = set(SESSION_ANALYSIS_FILES[session_id])
+    scoped = _tenant_scope_key(tenant_id, session_id)
+    if scoped not in SESSION_ANALYSIS_FILES:
+        SESSION_ANALYSIS_FILES[scoped] = []
+    existing = set(SESSION_ANALYSIS_FILES[scoped])
     new_files = [fid for fid in file_ids if fid not in existing]
-    SESSION_ANALYSIS_FILES[session_id].extend(new_files)
+    SESSION_ANALYSIS_FILES[scoped].extend(new_files)
 
-def get_analysis_files(session_id: str) -> List[str]:
+def get_analysis_files(session_id: str, tenant_id: str = "default") -> List[str]:
     """Get files from the shared analysis conversation."""
-    return SESSION_ANALYSIS_FILES.get(session_id, [])
+    scoped = _tenant_scope_key(tenant_id, session_id)
+    return SESSION_ANALYSIS_FILES.get(scoped, [])
 
 # Legacy alias for backward compatibility
-def get_or_create_analysis_thread(session_id: str) -> str:
+def get_or_create_analysis_thread(session_id: str, tenant_id: str = "default") -> str:
     """Legacy alias - use get_or_create_analysis_conversation instead."""
-    return get_or_create_analysis_conversation(session_id)
+    return get_or_create_analysis_conversation(session_id, tenant_id=tenant_id)
 
 redis_client = None
+_reset_limiter = RateLimiter(times=10, seconds=60)
+_chat_limiter = RateLimiter(times=3, seconds=60)
+_chat_text_limiter = RateLimiter(times=10, seconds=60)
+
+
+async def _safe_limit_call(limiter: RateLimiter, request: Request, response: Response, route_name: str):
+    try:
+        await limiter(request=request, response=response)
+    except Exception as exc:
+        # Fail-open only for Redis snapshot MISCONF (local/dev reliability issue).
+        if "MISCONF" in str(exc):
+            print(
+                json.dumps(
+                    {
+                        "timestamp": datetime.now(timezone.utc).isoformat(),
+                        "workflow": "rate_limiter",
+                        "route": route_name,
+                        "warning": "rate_limiter_fail_open_redis_misconf",
+                        "error": str(exc),
+                    },
+                    ensure_ascii=False,
+                ),
+                flush=True,
+            )
+            return
+        raise
+
+
+async def safe_reset_rate_limit(request: Request, response: Response):
+    await _safe_limit_call(_reset_limiter, request, response, "reset")
+
+
+async def safe_chat_rate_limit(request: Request, response: Response):
+    await _safe_limit_call(_chat_limiter, request, response, "chat")
+
+
+async def safe_chat_text_rate_limit(request: Request, response: Response):
+    await _safe_limit_call(_chat_text_limiter, request, response, "chat_text")
+
+
+class WorkflowEvalReq(BaseModel):
+    message: str
+    tenant_id: str = "default"
+    tools: Optional[List[Dict[str, Any]]] = None
+    force_refusal: bool = False
+    simulate_failure_mode: Optional[str] = None  # "timeout" | "tool_error"
+
+
+class ChatTextReq(BaseModel):
+    message: str
+    tenant_id: str
+    tools_override: Optional[List[Dict[str, Any]]] = None
 
 @app.on_event("startup")
 async def startup():
@@ -176,18 +316,455 @@ async def shutdown():
 def health():
     return {"ok": True}
 
-@app.post("/reset", dependencies=[Depends(RateLimiter(times=10, seconds=60))])
+
+def _default_tools_for_route(route_label: str) -> List[Dict[str, Any]]:
+    if route_label in {"tech", "investor"}:
+        return [
+            {"type": "file_search", "vector_store_ids": ["vs-default"]},
+            {"type": "code_interpreter", "container": {"type": "auto"}},
+        ]
+    return [{"type": "file_search", "vector_store_ids": ["vs-default"]}]
+
+
+def _simulate_tool_call_with_retry(tool: Dict[str, Any], failure_mode: Optional[str]) -> Dict[str, Any]:
+    attempts = 0
+    while attempts < 2:
+        attempts += 1
+        if failure_mode == "timeout":
+            if attempts == 1:
+                continue
+            raise TimeoutError("tool timed out")
+        if failure_mode == "tool_error":
+            if attempts == 1:
+                continue
+            raise RuntimeError("tool execution failed")
+        return {"ok": True, "attempts": attempts, "tool": tool.get("type", "unknown")}
+    return {"ok": False, "attempts": attempts, "tool": tool.get("type", "unknown")}
+
+
+@app.post("/workflow/execute")
+async def workflow_execute(req: WorkflowEvalReq):
+    started = time.time()
+    route = _deterministic_route(req.message)
+    tools = req.tools if req.tools is not None else _default_tools_for_route(route["label"])
+    schema_valid, schema_error = validate_tool_args(tools)
+    if not schema_valid:
+        ENTERPRISE_METRICS["schema_violations"] += 1
+        payload = schema_error_payload("workflow_tools", schema_error)
+        _log_workflow_telemetry(
+            workflow="workflow_execute",
+            tenant_id=req.tenant_id,
+            route=route["label"],
+            latency_ms=(time.time() - started) * 1000,
+            tool_calls=tool_count(tools),
+            tool_success=False,
+            schema_valid=False,
+            input_tokens=0,
+            output_tokens=0,
+        )
+        return JSONResponse(payload, status_code=400)
+
+    should_refuse = req.force_refusal or _should_refuse(req.message)
+    refusal_reason = "SAFETY_REFUSAL" if should_refuse else None
+    warning = None
+    tool_success = True
+    failure_mode = None
+
+    if not should_refuse:
+        for t in tools:
+            try:
+                _simulate_tool_call_with_retry(t, req.simulate_failure_mode)
+            except TimeoutError:
+                tool_success = False
+                warning = "partial_response_due_to_tool_timeout"
+                failure_mode = "timeout"
+                break
+            except Exception:
+                tool_success = False
+                failure_mode = "tool_failure"
+                break
+
+    answer = (
+        "I cannot help with that request."
+        if should_refuse
+        else "Workflow executed successfully."
+    )
+    output_tokens = max(1, len(answer.split()))
+    input_tokens = max(1, len(req.message.split()))
+    _log_workflow_telemetry(
+        workflow="workflow_execute",
+        tenant_id=req.tenant_id,
+        route=route["label"],
+        latency_ms=(time.time() - started) * 1000,
+        tool_calls=tool_count(tools),
+        tool_success=tool_success,
+        schema_valid=True,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
+    return {
+        "workflow": "workflow_execute",
+        "route": route,
+        "tool_names": tool_names(tools),
+        "tool_calls": tool_count(tools),
+        "tool_success": tool_success,
+        "schema_valid": True,
+        "schema_violation": False,
+        "refusal": {"is_refusal": should_refuse, "reason": refusal_reason},
+        "warning": warning,
+        "failure_mode": failure_mode,
+        "answer": answer,
+        "tokens": {"input": input_tokens, "output": output_tokens},
+        "cost_estimate_usd": _estimate_cost_usd(input_tokens, output_tokens, os.getenv("OPENAI_MODEL", "gpt-4o")),
+    }
+
+
+@app.post("/chat_text", dependencies=[Depends(safe_chat_text_rate_limit)])
+async def chat_text(req: ChatTextReq):
+    start_time = time.time()
+    user_msg = req.message.strip()
+    tenant_id = (req.tenant_id or "default").strip() or "default"
+    if not user_msg:
+        return JSONResponse({"error": "message required"}, status_code=400)
+
+    telemetry_warning = None
+    fallback_mode = None
+    tool_success = True
+    schema_valid = True
+
+    if req.tools_override is not None:
+        schema_ok, schema_error = validate_tool_args(req.tools_override)
+        if not schema_ok:
+            ENTERPRISE_METRICS["schema_violations"] += 1
+            tool_success = False
+            schema_valid = False
+            telemetry_warning = "tool_schema_validation_error"
+            latency_ms = int((time.time() - start_time) * 1000)
+            _log_workflow_telemetry(
+                workflow="chat_text",
+                tenant_id=tenant_id,
+                route="unknown",
+                latency_ms=latency_ms,
+                tool_calls=0,
+                tool_success=False,
+                schema_valid=False,
+                input_tokens=0,
+                output_tokens=0,
+                warning=telemetry_warning,
+            )
+            return JSONResponse(
+                {
+                    "answer": "",
+                    "routing": {},
+                    "strategy": "winner_take_all",
+                    "tool_names": [],
+                    "schema_valid": schema_valid,
+                    "refusal": {"is_refusal": True, "reason": "TOOL_SCHEMA_VALIDATION_ERROR"},
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "model": os.getenv("OPENAI_MODEL", "gpt-4o")},
+                    "telemetry": {
+                        "latency_ms": latency_ms,
+                        "cost_estimate_usd": 0.0,
+                        "tenant_id": tenant_id,
+                        "tool_success": False,
+                        "warning": telemetry_warning,
+                    },
+                    "error": schema_error_payload("tools_override", schema_error),
+                },
+                status_code=400,
+            )
+
+    routing = route_query(user_msg)
+    label = routing["label"]
+    confidence = routing["confidence"]
+    top2_label = routing["top2_label"]
+    margin = routing["margin"]
+    is_high_risk = routing["is_high_risk"]
+    session_id = "chat_text"
+
+    if _should_refuse(user_msg):
+        tool_success = False
+        fallback_mode = "safety_refusal"
+        telemetry_warning = "safety_refusal"
+        usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "model": os.getenv("OPENAI_MODEL", "gpt-4o")}
+        latency_ms = int((time.time() - start_time) * 1000)
+        _log_workflow_telemetry(
+            workflow="chat_text",
+            tenant_id=tenant_id,
+            route=label,
+            latency_ms=latency_ms,
+            tool_calls=0,
+            tool_success=tool_success,
+            schema_valid=schema_valid,
+            input_tokens=0,
+            output_tokens=0,
+            warning=telemetry_warning,
+        )
+        return {
+            "answer": "I cannot help with that request.",
+            "routing": routing,
+            "strategy": "winner_take_all",
+            "tool_names": [],
+            "schema_valid": schema_valid,
+            "refusal": {"is_refusal": True, "reason": "SAFETY_REFUSAL"},
+            "usage": usage,
+            "telemetry": {
+                "latency_ms": latency_ms,
+                "cost_estimate_usd": 0.0,
+                "tenant_id": tenant_id,
+                "tool_success": tool_success,
+                "warning": telemetry_warning,
+                "fallback_mode": fallback_mode,
+            },
+        }
+
+    strategy = "winner_take_all"
+    primary_response_id, _ = get_response_ids(label)
+    reviewer_response_id, _ = get_response_ids(top2_label)
+    if not primary_response_id:
+        latency_ms = int((time.time() - start_time) * 1000)
+        _log_workflow_telemetry(
+            workflow="chat_text",
+            tenant_id=tenant_id,
+            route=label,
+            latency_ms=latency_ms,
+            tool_calls=0,
+            tool_success=False,
+            schema_valid=schema_valid,
+            input_tokens=0,
+            output_tokens=0,
+            warning="missing_primary_response_config",
+        )
+        return JSONResponse({"error": f"Response '{label}' not found. Run: python scripts/seed_multi_responses.py"}, status_code=500)
+
+    primary_tools = _resolve_tools_for_response(primary_response_id, req.tools_override)
+    selected_tool_names = tool_names(primary_tools)
+    if primary_tools:
+        schema_ok, schema_error = validate_tool_args(primary_tools)
+        if not schema_ok:
+            ENTERPRISE_METRICS["schema_violations"] += 1
+            tool_success = False
+            schema_valid = False
+            telemetry_warning = "resolved_tool_schema_validation_error"
+            latency_ms = int((time.time() - start_time) * 1000)
+            _log_workflow_telemetry(
+                workflow="chat_text",
+                tenant_id=tenant_id,
+                route=label,
+                latency_ms=latency_ms,
+                tool_calls=len(selected_tool_names),
+                tool_success=False,
+                schema_valid=False,
+                input_tokens=0,
+                output_tokens=0,
+                warning=telemetry_warning,
+            )
+            return JSONResponse(
+                {
+                    "answer": "",
+                    "routing": routing,
+                    "strategy": "winner_take_all",
+                    "tool_names": selected_tool_names,
+                    "schema_valid": schema_valid,
+                    "refusal": {"is_refusal": True, "reason": "TOOL_SCHEMA_VALIDATION_ERROR"},
+                    "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "model": os.getenv("OPENAI_MODEL", "gpt-4o")},
+                    "telemetry": {
+                        "latency_ms": latency_ms,
+                        "cost_estimate_usd": 0.0,
+                        "tenant_id": tenant_id,
+                        "tool_success": False,
+                        "warning": telemetry_warning,
+                    },
+                    "error": schema_error_payload("resolved_tools", schema_error),
+                },
+                status_code=400,
+            )
+    primary_result = None
+    reviewer_result = None
+    total_usage = {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0}
+    reviewer_failed = False
+
+    try:
+        if is_data_analysis_flow(user_msg, False):
+            strategy = "data_analysis_flow"
+            analysis_conversation_id = get_or_create_analysis_conversation(session_id, tenant_id=tenant_id)
+            add_message(analysis_conversation_id, "user", user_msg, file_ids=None)
+            primary_result = run_assistant_structured(analysis_conversation_id, primary_response_id, tools_override=req.tools_override)
+            total_usage = primary_result.get("usage", {})
+        elif confidence >= 0.8:
+            strategy = "winner_take_all"
+            conversation_id = _get_or_create_conversation(label, tenant_id=tenant_id)
+            add_message(conversation_id, "user", user_msg, file_ids=None)
+            primary_result = run_assistant_structured(conversation_id, primary_response_id, tools_override=req.tools_override)
+            total_usage = primary_result.get("usage", {})
+        elif (0.5 <= confidence < 0.8) or is_high_risk:
+            strategy = "consult_then_decide"
+            conversation_id_primary = _get_or_create_conversation(label, tenant_id=tenant_id)
+            add_message(conversation_id_primary, "user", user_msg, file_ids=None)
+            primary_result = run_assistant_structured(conversation_id_primary, primary_response_id, tools_override=req.tools_override)
+            if reviewer_response_id:
+                reviewer_tools = _resolve_tools_for_response(reviewer_response_id, req.tools_override)
+                selected_tool_names = sorted(set(selected_tool_names + tool_names(reviewer_tools)))
+                conversation_id_reviewer = _get_or_create_conversation(top2_label, tenant_id=tenant_id)
+                critique_prompt = (
+                    f'The following is a response from {label.capitalize()}Advisor to the question: "{user_msg}"\n\n'
+                    f'{primary_result.get("answer", "")}\n\n'
+                    f'Provide a concise critique from a {top2_label} perspective.'
+                )
+                add_message(conversation_id_reviewer, "user", critique_prompt, file_ids=None)
+                try:
+                    reviewer_result = run_assistant_structured(conversation_id_reviewer, reviewer_response_id, tools_override=req.tools_override)
+                except Exception:
+                    reviewer_failed = True
+                    fallback_mode = "reviewer_call_failed"
+                    telemetry_warning = "reviewer_call_failed"
+                    reviewer_result = None
+                pu = primary_result.get("usage", {})
+                ru = reviewer_result.get("usage", {}) if reviewer_result else {}
+                total_usage = {
+                    "input_tokens": pu.get("input_tokens", 0) + ru.get("input_tokens", 0),
+                    "output_tokens": pu.get("output_tokens", 0) + ru.get("output_tokens", 0),
+                    "total_tokens": pu.get("total_tokens", 0) + ru.get("total_tokens", 0),
+                }
+            else:
+                fallback_mode = "missing_reviewer"
+                telemetry_warning = "missing_reviewer_fallback"
+                total_usage = primary_result.get("usage", {})
+        else:
+            strategy = "parallel_ensemble"
+            conversation_id_primary = _get_or_create_conversation(label, tenant_id=tenant_id)
+            add_message(conversation_id_primary, "user", user_msg, file_ids=None)
+            primary_result = run_assistant_structured(conversation_id_primary, primary_response_id, tools_override=req.tools_override)
+            if reviewer_response_id:
+                reviewer_tools = _resolve_tools_for_response(reviewer_response_id, req.tools_override)
+                selected_tool_names = sorted(set(selected_tool_names + tool_names(reviewer_tools)))
+                conversation_id_reviewer = _get_or_create_conversation(top2_label, tenant_id=tenant_id)
+                add_message(conversation_id_reviewer, "user", user_msg, file_ids=None)
+                try:
+                    reviewer_result = run_assistant_structured(conversation_id_reviewer, reviewer_response_id, tools_override=req.tools_override)
+                except Exception:
+                    reviewer_failed = True
+                    fallback_mode = "reviewer_call_failed"
+                    telemetry_warning = "reviewer_call_failed"
+                    reviewer_result = None
+                pu = primary_result.get("usage", {})
+                ru = reviewer_result.get("usage", {}) if reviewer_result else {}
+                total_usage = {
+                    "input_tokens": pu.get("input_tokens", 0) + ru.get("input_tokens", 0),
+                    "output_tokens": pu.get("output_tokens", 0) + ru.get("output_tokens", 0),
+                    "total_tokens": pu.get("total_tokens", 0) + ru.get("total_tokens", 0),
+                }
+            else:
+                fallback_mode = "missing_reviewer"
+                telemetry_warning = "missing_reviewer_fallback"
+                total_usage = primary_result.get("usage", {})
+    except Exception as e:
+        tool_success = False
+        telemetry_warning = "responses_run_error"
+        latency_ms = int((time.time() - start_time) * 1000)
+        _log_workflow_telemetry(
+            workflow="chat_text",
+            tenant_id=tenant_id,
+            route=label,
+            latency_ms=latency_ms,
+            tool_calls=len(selected_tool_names),
+            tool_success=False,
+            schema_valid=schema_valid,
+            input_tokens=0,
+            output_tokens=0,
+            warning=telemetry_warning,
+        )
+        return JSONResponse(
+            {
+                "error": str(e),
+                "routing": routing,
+                "strategy": strategy,
+                "tool_names": selected_tool_names,
+                "schema_valid": schema_valid,
+                "refusal": {"is_refusal": False, "reason": None},
+                "usage": {"input_tokens": 0, "output_tokens": 0, "total_tokens": 0, "model": os.getenv("OPENAI_MODEL", "gpt-4o")},
+                "telemetry": {
+                    "latency_ms": latency_ms,
+                    "cost_estimate_usd": 0.0,
+                    "tenant_id": tenant_id,
+                    "tool_success": tool_success,
+                    "warning": telemetry_warning,
+                },
+            },
+            status_code=500,
+        )
+
+    primary_meta = primary_result.get("run_meta", {}) if primary_result else {"failed": True, "failure_mode": "missing_primary_result"}
+    reviewer_meta = reviewer_result.get("run_meta", {}) if reviewer_result else {}
+    if primary_meta.get("failed") or primary_meta.get("warning") or primary_meta.get("partial"):
+        tool_success = False
+        if not telemetry_warning:
+            telemetry_warning = primary_meta.get("warning") or primary_meta.get("failure_mode") or "primary_run_issue"
+    if reviewer_failed or reviewer_meta.get("failed") or reviewer_meta.get("warning") or reviewer_meta.get("partial"):
+        tool_success = False
+        telemetry_warning = telemetry_warning or reviewer_meta.get("warning") or "reviewer_call_failed"
+        fallback_mode = fallback_mode or "reviewer_call_failed"
+    if fallback_mode and fallback_mode != "safety_refusal":
+        tool_success = False
+
+    answer = primary_result.get("answer", "") if primary_result else ""
+    if reviewer_result:
+        answer = f"{answer}\n\n{reviewer_result.get('answer', '')}".strip()
+
+    usage_payload = {
+        "input_tokens": int(total_usage.get("input_tokens", 0) or 0),
+        "output_tokens": int(total_usage.get("output_tokens", 0) or 0),
+        "total_tokens": int(total_usage.get("total_tokens", 0) or 0),
+        "model": os.getenv("OPENAI_MODEL", "gpt-4o"),
+    }
+    latency_ms = int((time.time() - start_time) * 1000)
+    _log_workflow_telemetry(
+        workflow="chat_text",
+        tenant_id=tenant_id,
+        route=label,
+        latency_ms=latency_ms,
+        tool_calls=len(selected_tool_names),
+        tool_success=tool_success,
+        schema_valid=schema_valid,
+        input_tokens=usage_payload["input_tokens"],
+        output_tokens=usage_payload["output_tokens"],
+        warning=telemetry_warning,
+    )
+    return {
+        "answer": answer,
+        "routing": routing,
+        "strategy": strategy,
+        "tool_names": selected_tool_names,
+        "schema_valid": schema_valid,
+        "refusal": {"is_refusal": False, "reason": None},
+        "usage": usage_payload,
+        "telemetry": {
+            "latency_ms": latency_ms,
+            "cost_estimate_usd": _estimate_cost_usd(usage_payload["input_tokens"], usage_payload["output_tokens"], usage_payload["model"]),
+            "tenant_id": tenant_id,
+            "tool_success": tool_success,
+            "warning": telemetry_warning,
+            "fallback_mode": fallback_mode,
+        },
+    }
+
+@app.post("/reset", dependencies=[Depends(safe_reset_rate_limit)])
 async def reset(request: Request):
     """Reset conversations (Responses API uses conversations instead of threads)."""
     session_id = await get_session_id(request)
+    tenant_id = (request.headers.get("x-tenant-id", "default") or "default").strip() or "default"
+    scoped_session = _tenant_scope_key(tenant_id, session_id)
+    scoped_legacy_key = _tenant_scope_key(tenant_id, "conversation_id")
     conversation = create_thread()  # Creates a new conversation
-    CONVERSATIONS["conversation_id"] = conversation.id
-    CONVERSATIONS_BY_LABEL.clear()  # Clear all label-specific conversations
+    CONVERSATIONS[scoped_legacy_key] = conversation.id
+    # Clear all label-specific conversations for this tenant
+    tenant_prefix = f"{tenant_id}:"
+    for key in [k for k in list(CONVERSATIONS_BY_LABEL.keys()) if k.startswith(tenant_prefix)]:
+        del CONVERSATIONS_BY_LABEL[key]
     # Clear analysis conversation for this session
-    if session_id in SESSION_ANALYSIS_CONVERSATION:
-        del SESSION_ANALYSIS_CONVERSATION[session_id]
-    if session_id in SESSION_ANALYSIS_FILES:
-        del SESSION_ANALYSIS_FILES[session_id]
+    if scoped_session in SESSION_ANALYSIS_CONVERSATION:
+        del SESSION_ANALYSIS_CONVERSATION[scoped_session]
+    if scoped_session in SESSION_ANALYSIS_FILES:
+        del SESSION_ANALYSIS_FILES[scoped_session]
     return {"thread_id": conversation.id, "message": "All conversations reset"}  # Keep thread_id in response for API compatibility
 
 def _has_grounded_content(result: dict) -> bool:
@@ -197,24 +774,25 @@ def _has_grounded_content(result: dict) -> bool:
     # Consider it grounded if there are sources or a substantial answer (>50 chars)
     return len(sources) > 0 or len(answer) > 50
 
-def _get_or_create_conversation(label: str) -> str:
+def _get_or_create_conversation(label: str, tenant_id: str = "default") -> str:
     """Get or create a conversation for a specific response label."""
-    if label not in CONVERSATIONS_BY_LABEL:
+    scoped_label = _tenant_scope_key(tenant_id, label)
+    if scoped_label not in CONVERSATIONS_BY_LABEL:
         conversation = create_thread()  # create_thread creates a conversation in Responses API
-        CONVERSATIONS_BY_LABEL[label] = conversation.id
-    return CONVERSATIONS_BY_LABEL[label]
+        CONVERSATIONS_BY_LABEL[scoped_label] = conversation.id
+    return CONVERSATIONS_BY_LABEL[scoped_label]
 
 # Legacy alias for backward compatibility
-def _get_or_create_thread(label: str) -> str:
+def _get_or_create_thread(label: str, tenant_id: str = "default") -> str:
     """Legacy alias - use _get_or_create_conversation instead."""
-    return _get_or_create_conversation(label)
+    return _get_or_create_conversation(label, tenant_id=tenant_id)
 
 # main costed endpoint: 3 req / 60s per IP
 # This endpoint uses Responses API exclusively:
 # - Conversations API (client.conversations.create) for conversation management
 # - Responses API (client.responses.create) for generating responses
 # - In-memory conversation history tracking (passed as input to responses.create)
-@app.post("/chat", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
+@app.post("/chat", dependencies=[Depends(safe_chat_rate_limit)])
 async def chat(
     request: Request,
     message: str = Form(...),
@@ -230,6 +808,7 @@ async def chat(
     """
     start_time = time.time()
     user_msg = message.strip()
+    tenant_id = (request.headers.get("x-tenant-id", "default") or "default").strip() or "default"
     if not user_msg:
         return JSONResponse({"error": "message required"}, status_code=400)
 
@@ -241,11 +820,12 @@ async def chat(
         if not response_id:
             return JSONResponse({"error": "Seed first: python scripts/seed_multi_responses.py"}, status_code=500)
         
-        conversation_id = CONVERSATIONS.get("conversation_id")
+        legacy_conversation_key = _tenant_scope_key(tenant_id, "conversation_id")
+        conversation_id = CONVERSATIONS.get(legacy_conversation_key)
         if not conversation_id:
             conversation = create_thread()  # Creates a conversation in Responses API
             conversation_id = conversation.id
-            CONVERSATIONS["conversation_id"] = conversation_id
+            CONVERSATIONS[legacy_conversation_key] = conversation_id
         
         try:
             file_ids = []
@@ -327,17 +907,17 @@ async def chat(
         
         # Step 3: Handle data analysis flows with shared analysis conversation
         if is_data_flow:
-            analysis_conversation_id = get_or_create_analysis_conversation(session_id)
+            analysis_conversation_id = get_or_create_analysis_conversation(session_id, tenant_id=tenant_id)
             
             # Track files in analysis conversation
             analysis_file_ids = list(file_ids) if file_ids else []
             if not analysis_file_ids:
-                previous_analysis_files = get_analysis_files(session_id)
+                previous_analysis_files = get_analysis_files(session_id, tenant_id=tenant_id)
                 if previous_analysis_files:
                     analysis_file_ids = previous_analysis_files
             
             if file_ids:
-                track_analysis_files(session_id, file_ids)
+                track_analysis_files(session_id, file_ids, tenant_id=tenant_id)
             
             # Use InvestorAdvisor for data analysis (has code_interpreter)
             response_id, _ = get_response_ids("investor")
@@ -386,7 +966,7 @@ async def chat(
         
         # Strategy 1: Winner-take-all (confidence >= 0.8)
         if confidence >= 0.8:
-            conversation_id = _get_or_create_conversation(label)
+            conversation_id = _get_or_create_conversation(label, tenant_id=tenant_id)
             
             # If no new files but user is asking about data, re-attach previous files from this conversation
             if not file_ids and detect_data_reference(user_msg):
@@ -406,7 +986,7 @@ async def chat(
         elif (0.5 <= confidence < 0.8) or is_high_risk:
             if not reviewer_response_id:
                 # Fallback to primary only if reviewer not available
-                conversation_id = _get_or_create_conversation(label)
+                conversation_id = _get_or_create_conversation(label, tenant_id=tenant_id)
                 
                 # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not file_ids and detect_data_reference(user_msg):
@@ -423,7 +1003,7 @@ async def chat(
                 total_usage = primary_result.get("usage", {})
             else:
                 # Run primary first
-                conversation_id_primary = _get_or_create_conversation(label)
+                conversation_id_primary = _get_or_create_conversation(label, tenant_id=tenant_id)
                 
                 # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not file_ids and detect_data_reference(user_msg):
@@ -439,7 +1019,7 @@ async def chat(
                 primary_result = run_assistant_structured(conversation_id_primary, primary_response_id)
                 
                 # Then ask reviewer to critique (Devil's Advocate pass)
-                conversation_id_reviewer = _get_or_create_conversation(top2_label)
+                conversation_id_reviewer = _get_or_create_conversation(top2_label, tenant_id=tenant_id)
                 primary_answer = primary_result.get("answer", "")
                 primary_bullets = primary_result.get("bullets", [])
                 
@@ -480,7 +1060,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
         else:
             if not reviewer_response_id:
                 # Fallback to primary only
-                conversation_id = _get_or_create_conversation(label)
+                conversation_id = _get_or_create_conversation(label, tenant_id=tenant_id)
                 
                 # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not file_ids and detect_data_reference(user_msg):
@@ -497,7 +1077,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
                 total_usage = primary_result.get("usage", {})
             else:
                 # Run both in parallel (sequentially for now, but could be parallelized)
-                conversation_id_primary = _get_or_create_conversation(label)
+                conversation_id_primary = _get_or_create_conversation(label, tenant_id=tenant_id)
                 
                 # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not file_ids and detect_data_reference(user_msg):
@@ -512,7 +1092,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
                 add_message(conversation_id_primary, "user", user_msg, file_ids=file_ids if file_ids else None)
                 primary_result = run_assistant_structured(conversation_id_primary, primary_response_id)
                 
-                conversation_id_reviewer = _get_or_create_conversation(top2_label)
+                conversation_id_reviewer = _get_or_create_conversation(top2_label, tenant_id=tenant_id)
                 # Reviewer also gets the same files if available
                 add_message(conversation_id_reviewer, "user", user_msg, file_ids=file_ids if file_ids else None)
                 reviewer_result = run_assistant_structured(conversation_id_reviewer, reviewer_response_id)  # conversation_id is used as conversation_id, response_id is response_config_id
@@ -529,7 +1109,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
         # Step 4: Check if both assistants retrieved nothing (for ensemble cases)
         if reviewer_result and not _has_grounded_content(primary_result) and not _has_grounded_content(reviewer_result):
             return {
-                "thread_id": _get_or_create_conversation(label),  # Keep thread_id in response for API compatibility
+                "thread_id": _get_or_create_conversation(label, tenant_id=tenant_id),  # Keep thread_id in response for API compatibility
                 "answer": "I need a bit more context to help you effectively. Could you clarify:\n- What specific aspect are you most interested in?\n- Are you looking for technical guidance, marketing strategy, or investor/fundraising advice?\n- What's your current situation or challenge?",
                 "sources": [],
                 "raw_text": "",
@@ -607,7 +1187,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
         )
         
         return {
-            "thread_id": _get_or_create_conversation(label),  # Keep thread_id in response for API compatibility
+            "thread_id": _get_or_create_conversation(label, tenant_id=tenant_id),  # Keep thread_id in response for API compatibility
             "answer": answer,
             "sources": sources,
             "raw_text": primary_result.get("raw_text", "") if primary_result else "",
@@ -635,7 +1215,11 @@ def root():
 @app.get("/api/metrics")
 def get_metrics():
     """Get metrics data as JSON."""
-    return metrics.get_stats()
+    payload = metrics.get_stats()
+    payload["enterprise"] = {
+        "schema_violations": ENTERPRISE_METRICS["schema_violations"] + get_schema_violation_count()
+    }
+    return payload
 
 @app.post("/api/metrics/reset")
 def reset_metrics():
@@ -673,7 +1257,7 @@ def get_container_file(container_id: str, file_id: str):
             content={"error": f"Could not download container file {file_id}: {str(e)}"}
         )
 
-@app.post("/chat/stream", dependencies=[Depends(RateLimiter(times=3, seconds=60))])
+@app.post("/chat/stream", dependencies=[Depends(safe_chat_rate_limit)])
 async def chat_stream(
     request: Request,
     message: str = Form(...),
@@ -682,6 +1266,7 @@ async def chat_stream(
     """Streaming chat endpoint using Server-Sent Events."""
     start_time = time.time()
     user_msg = message.strip()
+    tenant_id = (request.headers.get("x-tenant-id", "default") or "default").strip() or "default"
     if not user_msg:
         return JSONResponse({"error": "message required"}, status_code=400)
 
@@ -716,11 +1301,12 @@ async def chat_stream(
                     yield f"data: {json.dumps({'type': 'error', 'error': 'Seed first: python scripts/seed_multi_responses.py'})}\n\n"
                     return
                 
-                conversation_id = CONVERSATIONS.get("conversation_id")
+                legacy_conversation_key = _tenant_scope_key(tenant_id, "conversation_id")
+                conversation_id = CONVERSATIONS.get(legacy_conversation_key)
                 if not conversation_id:
                     conversation = create_thread()  # Creates a conversation in Responses API
                     conversation_id = conversation.id
-                    CONVERSATIONS["conversation_id"] = conversation_id
+                    CONVERSATIONS[legacy_conversation_key] = conversation_id
                 
                 # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not file_ids and detect_data_reference(user_msg):
@@ -795,18 +1381,18 @@ async def chat_stream(
             # Data analysis flow: use shared analysis conversation for CSV/data iterations
             if is_data_flow:
                 # Use shared analysis conversation for data flows
-                analysis_conversation_id = get_or_create_analysis_conversation(session_id)
+                analysis_conversation_id = get_or_create_analysis_conversation(session_id, tenant_id=tenant_id)
                 
                 # Track files in analysis conversation
                 analysis_file_ids = list(file_ids) if file_ids else []
                 if not analysis_file_ids:
                     # If no new files, get previous analysis files
-                    previous_analysis_files = get_analysis_files(session_id)
+                    previous_analysis_files = get_analysis_files(session_id, tenant_id=tenant_id)
                     if previous_analysis_files:
                         analysis_file_ids = previous_analysis_files
                 
                 if file_ids:
-                    track_analysis_files(session_id, file_ids)
+                    track_analysis_files(session_id, file_ids, tenant_id=tenant_id)
                 
                 # For data flows, use InvestorAdvisor (has code_interpreter) or the routed assistant
                 # But prefer InvestorAdvisor for data analysis
@@ -885,7 +1471,7 @@ async def chat_stream(
             
             # Strategy 1: Winner-take-all (confidence >= 0.8)
             if confidence >= 0.8:
-                conversation_id = _get_or_create_conversation(label)
+                conversation_id = _get_or_create_conversation(label, tenant_id=tenant_id)
                 
                 # If no new files but user is asking about data, re-attach previous files from this conversation
                 if not final_file_ids and detect_data_reference(user_msg):
@@ -916,7 +1502,7 @@ async def chat_stream(
             elif (0.5 <= confidence < 0.8) or is_high_risk:
                 if not reviewer_response_id:
                     # Fallback to primary only
-                    thread_id = _get_or_create_thread(label)
+                    thread_id = _get_or_create_thread(label, tenant_id=tenant_id)
                     
                     # If no new files but user is asking about data, re-attach previous files from this thread
                     if not final_file_ids and detect_data_reference(user_msg):
@@ -943,7 +1529,7 @@ async def chat_stream(
                                 track_produced_files(session_id, image_file_ids)
                 else:
                     # Stream primary first
-                    conversation_id_primary = _get_or_create_conversation(label)
+                    conversation_id_primary = _get_or_create_conversation(label, tenant_id=tenant_id)
                     
                     # If no new files but user is asking about data, re-attach previous files from this conversation
                     if not final_file_ids and detect_data_reference(user_msg):
@@ -981,7 +1567,7 @@ async def chat_stream(
                     yield f"data: {json.dumps({'type': 'phase_transition', 'from': 'primary', 'to': 'reviewer'})}\n\n"
                     
                     # Then ask reviewer to critique
-                    conversation_id_reviewer = _get_or_create_conversation(top2_label)
+                    conversation_id_reviewer = _get_or_create_conversation(top2_label, tenant_id=tenant_id)
                     # Include product card in critique prompt if available
                     critique_context = ""
                     if product_card:
@@ -1022,7 +1608,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
             else:
                 if not reviewer_response_id:
                     # Fallback to primary only
-                    thread_id = _get_or_create_thread(label)
+                    thread_id = _get_or_create_thread(label, tenant_id=tenant_id)
                     
                     # If no new files but user is asking about data, re-attach previous files from this thread
                     if not final_file_ids and detect_data_reference(user_msg):
@@ -1049,7 +1635,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
                                 track_produced_files(session_id, image_file_ids)
                 else:
                     # Stream primary first
-                    thread_id_primary = _get_or_create_thread(label)
+                    thread_id_primary = _get_or_create_thread(label, tenant_id=tenant_id)
                     
                     # If no new files but user is asking about data, re-attach previous files from this thread
                     if not final_file_ids and detect_data_reference(user_msg):
@@ -1081,7 +1667,7 @@ Be constructive and specific. Focus on adding value, not just criticizing."""
                     yield f"data: {json.dumps({'type': 'phase_transition', 'from': 'primary', 'to': 'reviewer'})}\n\n"
                     
                     # Stream reviewer response (independent answer)
-                    conversation_id_reviewer = _get_or_create_conversation(top2_label)
+                    conversation_id_reviewer = _get_or_create_conversation(top2_label, tenant_id=tenant_id)
                     add_message(conversation_id_reviewer, "user", final_message, file_ids=final_file_ids if final_file_ids else None)
                     
                     for chunk in run_assistant_stream(conversation_id_reviewer, reviewer_response_id):  # conversation_id is used as conversation_id, response_id is response_config_id

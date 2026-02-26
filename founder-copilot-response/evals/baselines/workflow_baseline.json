@@ -1,0 +1,49 @@
+{
+  "generated_at": "2026-02-26T07:53:24.320767+00:00",
+  "dataset": "evals/datasets/workflow_eval.jsonl",
+  "metrics": {
+    "non_refusal_overall": {
+      "count": 16,
+      "latency_ms_p50": 10488.0,
+      "latency_ms_p95": 30103.0,
+      "cost_usd_mean": 0.053754,
+      "cost_usd_p95": 0.168525,
+      "tokens_total_mean": 10182.0,
+      "tokens_total_p95": 32431.0
+    },
+    "non_refusal_by_route": {
+      "tech": {
+        "count": 7,
+        "latency_ms_p50": 20317.0,
+        "latency_ms_p95": 30103.0,
+        "cost_usd_mean": 0.064845,
+        "cost_usd_p95": 0.168525,
+        "tokens_total_mean": 12385.57,
+        "tokens_total_p95": 32431.0
+      },
+      "marketing": {
+        "count": 5,
+        "latency_ms_p50": 7162.0,
+        "latency_ms_p95": 15633.0,
+        "cost_usd_mean": 0.051538,
+        "cost_usd_p95": 0.069475,
+        "tokens_total_mean": 9704.0,
+        "tokens_total_p95": 13259.0
+      },
+      "investor": {
+        "count": 4,
+        "latency_ms_p50": 10488.0,
+        "latency_ms_p95": 20404.0,
+        "cost_usd_mean": 0.037114,
+        "cost_usd_p95": 0.043005,
+        "tokens_total_mean": 6923.25,
+        "tokens_total_p95": 8113.0
+      }
+    },
+    "refusal_overall": {
+      "count": 5,
+      "latency_ms_mean": 500.4,
+      "cost_usd_mean": 0.0
+    }
+  }
+}

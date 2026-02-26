@@ -1,15 +1,15 @@
 # Founder Copilot (Responses API)
 
-An AI-powered assistant for startup founders, migrated from OpenAI's Assistants API to the Responses API. This project maintains all the functionality of the original founder-copilot but uses the new Responses API instead of the deprecated Assistants API.
+An AI-powered assistant for startup founders, migrated from OpenAI's Assistants API to the Responses API. Core inference runs on `client.responses.create` with optional conversation state via `client.conversations`.
 
 ## Migration Status
 
 This project is a migration from the Assistants API to the Responses API. Key changes:
 
-- **Assistants → System Prompts**: Instead of creating assistant objects, we use system prompts with Chat Completions
-- **Threads → Conversation History**: Instead of thread management, we maintain conversation history in memory/database
-- **file_search tool → Vector Search**: Instead of using the file_search tool, we perform vector search ourselves and inject context
-- **code_interpreter tool → Function Calling**: Instead of code_interpreter, we use function calling with Python execution
+- **Assistants/Threads → Response Config + Conversations**: assistant behavior is represented as response configs; state is kept with conversation IDs.
+- **Core generation → Responses API**: requests are executed with `client.responses.create` (streaming and non-streaming paths).
+- **Tooling remains OpenAI-native**: `file_search` and `code_interpreter` are passed as Responses tools and schema-validated before execution in workflow paths.
+- **Legacy wrapper names retained**: helper names like `create_thread`/`run_assistant_structured` are compatibility wrappers over Responses primitives.
 
 ## Features
 
@@ -28,6 +28,10 @@ This project is a migration from the Assistants API to the Responses API. Key ch
 - 📊 **Metrics Dashboard** - Track token usage, latency (P95), and request statistics
 - 🚦 **Rate Limiting** - Redis-based rate limiting to protect API endpoints
 - 🐳 **Docker Support** - Easy deployment with Docker Compose
+- ✅ **Tool Schema Validation** - JSON Schema validation for workflow tool arguments before execution
+- 📡 **Enterprise Telemetry** - Structured JSON workflow logs with route, tools, tokens, and cost estimate
+- 🧪 **Eval Gating** - Offline eval suite and CI workflow regression checks
+- 🛟 **Failure Mode Handling** - Single retry on tool failure + timeout partial-warning behavior
 
 ## Setup
 
@@ -46,6 +50,50 @@ This project is a migration from the Assistants API to the Responses API. Key ch
 3. **Access the application**:
    - Web Interface: http://localhost:8000
    - Metrics Dashboard: http://localhost:8000/metrics
+
+## Safety + Deployment Architecture
+
+This repo now includes a deployment-grade workflow path at `POST /workflow/execute` that is used for eval/CI:
+
+1. Deterministic route selection (tech/marketing/investor)
+2. Tool selection and pre-execution JSON Schema validation
+3. Retry-once failure handling for tool execution
+4. Timeout fallback with partial warning
+5. Structured telemetry log output per workflow:
+   - workflow, tenant, route
+   - latency, tool count/success, schema validity
+   - token counts and simple USD cost estimate
+
+Schema violations are rejected before execution and counted in enterprise metrics.
+
+Deployment workshop + pilot artifacts are in `deployment-playbook/`:
+- `deployment-playbook/WORKSHOP_TEMPLATE.md`
+- `deployment-playbook/USE_CASE_SCORING_RUBRIC.md`
+- `deployment-playbook/PILOT_SUCCESS_METRICS.md`
+
+## Offline Evals
+
+Run evals locally:
+
+```bash
+# Terminal 1
+uvicorn app.main:app --host 0.0.0.0 --port 8000
+
+# Terminal 2
+# compare mode (default): validates behavior + perf regressions vs baseline
+python evals/run.py
+
+# update baseline intentionally after approved perf changes
+python evals/run.py --update-baseline
+# then commit evals/baselines/workflow_baseline.json
+```
+
+Dataset location:
+- `evals/datasets/workflow_eval.jsonl` (25+ cases)
+- Includes routing, tool selection, invalid schema, refusal, and failure mode checks
+
+CI gate:
+- `.github/workflows/evals.yml` runs this suite on PRs and pushes to `main`
 
 ## Migration Notes
 

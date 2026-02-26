@@ -58,6 +58,7 @@ state/
 # OS
 .DS_Store
 .DS_Store?
+__MACOSX/
 ._*
 .Spotlight-V100
 .Trashes
@@ -69,6 +70,7 @@ Desktop.ini
 *.log
 logs/
 *.log.*
+evals/out/
 
 # Docker
 .dockerignore

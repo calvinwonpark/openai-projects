@@ -1,0 +1,53 @@
+name: founder-copilot-response-evals
+
+on:
+  pull_request:
+    paths:
+      - "founder-copilot-response/app/**"
+      - "founder-copilot-response/evals/**"
+      - "founder-copilot-response/requirements.txt"
+      - "founder-copilot-response/.github/workflows/evals.yml"
+  push:
+    branches: [main]
+    paths:
+      - "founder-copilot-response/app/**"
+      - "founder-copilot-response/evals/**"
+      - "founder-copilot-response/requirements.txt"
+      - "founder-copilot-response/.github/workflows/evals.yml"
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: founder-copilot-response
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Start server
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          uvicorn app.main:app --host 0.0.0.0 --port 8000 > /tmp/fcr.log 2>&1 &
+          for i in {1..30}; do
+            if curl -fsS http://localhost:8000/health >/dev/null; then
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "Server failed to start"
+          cat /tmp/fcr.log
+          exit 1
+
+      - name: Run evals (compare to baseline)
+        run: python evals/run.py
