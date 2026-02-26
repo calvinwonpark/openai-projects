@@ -1,6 +1,6 @@
 # 🎓 TeachMe Live
 
-A real-time voice tutoring application powered by OpenAI's Realtime API. Upload textbook questions or images, and have natural voice conversations with an AI tutor in English or Korean.
+A production-style realtime voice tutoring application powered by OpenAI APIs. It supports realtime tutoring plus a transcript-only backend path for safety controls, observability, and offline CI evals.
 
 ## ✨ Features
 
@@ -13,6 +13,11 @@ A real-time voice tutoring application powered by OpenAI's Realtime API. Upload 
 - **Natural Backchannels**: AI uses natural thinking sounds ("mm-hmm", "let me think", "음...", "그렇군요") while processing
 - **Modern UI**: Beautiful, responsive interface with drag-and-drop image upload
 - **Live Logging**: Real-time session activity logs for debugging and monitoring
+- **PII Guardrails**: Transcript redaction for email/phone/address before model calls, logs, and trace storage
+- **Safety Router**: Rule-based risk classification with high-risk refusal mode (self-harm, medical, legal, financial, hate/harassment)
+- **Latency/Cost Budgets**: Context limits, token caps, low temperature defaults, and degraded mode handling
+- **Structured Turn Logs + Traces**: Per-turn JSON logs with stage latencies/tokens plus bounded redacted trace retrieval
+- **Offline Eval + CI Gate**: Transcript eval suite (no microphone needed) with GitHub Actions workflow
 
 ## 🚀 Quick Start
 
@@ -90,9 +95,19 @@ A real-time voice tutoring application powered by OpenAI's Realtime API. Upload 
 
 ```
 teachme-live/
-├── app.py                 # FastAPI backend server
+├── app.py                 # FastAPI backend server + /chat_text safety path
+├── pii.py                 # PII detect/redact helpers
+├── safety.py              # Rule-based safety classifier
 ├── requirements.txt       # Python dependencies
 ├── .env                   # Environment variables (create this)
+├── evals/
+│   ├── README.md
+│   ├── run.py             # Offline transcript eval runner
+│   └── datasets/
+│       └── transcript_eval.jsonl
+├── .github/
+│   └── workflows/
+│       └── evals.yml      # CI gate for evals
 ├── static/
 │   ├── index.html        # Main UI
 │   └── realtime.js       # Client-side WebRTC logic
@@ -120,11 +135,80 @@ Generates an ephemeral client secret for connecting to OpenAI's Realtime API.
 **Response**:
 ```json
 {
-  "client_secret": "ephemeral_key_here"
+  "client_secret": "ephemeral_key_here",
+  "realtime_model": "gpt-realtime"
 }
 ```
 
+### `POST /chat_text`
+Processes transcript text without microphone input (used for offline evals and safety checks).
+
+Request:
+```json
+{
+  "transcript": "Explain Newton's second law.",
+  "session_id": "optional-session-id",
+  "stt_confidence": 0.92,
+  "tts_enabled": false
+}
+```
+
+Response:
+```json
+{
+  "request_id": "uuid",
+  "session_id": "session-123",
+  "turn_id": 3,
+  "answer": "Force equals mass times acceleration...",
+  "language": "en",
+  "refusal": { "is_refusal": false, "reason": null },
+  "safety": { "level": "low", "categories": [] },
+  "pii": { "detected": false, "redacted": false },
+  "mode": "normal",
+  "ask_clarifying": false,
+  "latency_ms": { "stt": 0, "llm": 420, "tts": 0, "end_to_end": 445 },
+  "tokens": { "input": 210, "output": 88 }
+}
+```
+
+### `GET /debug/trace/{session_id}`
+Returns stored redacted traces for the session (bounded in-memory store, max 200 turns globally).
+
+### `POST /telemetry`
+Ingests realtime turn telemetry and stores it in the same bounded redacted trace store used by `/chat_text`.
+
+### `GET /metrics`
+Returns aggregate metrics (turn counts, refusal/text-only counts, token totals, tokens-per-turn).
+
+## 🧭 Safety + Observability Architecture
+
+Realtime voice sessions are policy-gated through the backend:
+
+1. Realtime client receives a final transcript event.
+2. Client sends transcript to `POST /chat_text` with `session_id` and STT confidence.
+3. Backend applies the same safety/PII/latency pipeline used by evals:
+   - PII redaction before model/log/trace
+   - Safety routing (high risk => refusal)
+   - Budget/degraded mode decisions (`normal`, `text_only`, `refusal`)
+4. Client obeys backend mode and cancels any in-flight realtime response before rendering/speaking backend-approved answer.
+5. Client posts `POST /telemetry`; backend stores telemetry in `/debug/trace/{session_id}`.
+
+Raw audio and unredacted transcripts are not stored in traces.
+
 ## ⚙️ Configuration
+
+### Safety and Latency Budgets
+
+The backend enforces conservative defaults:
+
+- `MAX_TURNS_STORED=12` (older turns are compacted into rolling summary)
+- `MAX_INPUT_TOKENS=1200` (approximate char-based input trimming)
+- `MAX_OUTPUT_TOKENS=300` (chat completion cap)
+- `CHAT_TEMPERATURE=0.2`
+- `STT_CONFIDENCE_THRESHOLD=0.7` (below this asks user to repeat slowly)
+- `LLM_LATENCY_BUDGET_MS=2500` (if exceeded, mark turn as `text_only`)
+
+If TTS fails, the server returns text and keeps the session alive (`mode=text_only`).
 
 ### Speech Stop Delay
 
@@ -204,15 +288,29 @@ The `--reload` flag enables auto-reload on code changes.
 
 ### Testing
 
-1. Start the server
-2. Open the application in your browser
-3. Check the browser console (F12) for logs
-4. Monitor the session logs in the UI
+Run the offline transcript evals (no microphone required):
+
+```bash
+# Terminal 1
+uvicorn app:app --host 0.0.0.0 --port 8000
+
+# Terminal 2
+python evals/run.py
+```
+
+If needed:
+```bash
+API_BASE_URL=http://localhost:8010 python evals/run.py
+```
+
+CI gate is defined at `.github/workflows/evals.yml` and runs this suite on PRs and pushes to `main`.
 
 ## 🔒 Security Notes
 
 - The ephemeral client secret is generated server-side and never exposed in the frontend code
 - API keys should never be committed to version control
+- Raw audio is not stored in debug traces
+- Unredacted transcripts are not stored in logs/traces
 - For production, consider:
   - Restricting CORS origins
   - Adding authentication

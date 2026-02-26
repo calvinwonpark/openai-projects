@@ -18,6 +18,10 @@ const responseKinds = {};
 // Track active response IDs
 let activeResponseIds = new Set();
 let pendingNotesRequest = false; // Flag to request notes after current response completes
+let realtimeModel = "gpt-realtime";
+let currentSessionId = null;
+const handledTranscriptEvents = new Set();
+let transcriptPipeline = Promise.resolve();
 
 let pc = null;                  // RTCPeerConnection
 let dc = null;                  // RTCDataChannel
@@ -26,6 +30,13 @@ let clientSecret = null;        // ephemeral key
 let uploadedImageUrl = null;    // "data:image/png;base64,..." string
 let speechStopTimeout = null;   // Timeout for debouncing speech stop
 const SPEECH_STOP_DELAY_MS = 2000; // Wait 2 seconds of silence before detecting speech stop
+
+function generateSessionId() {
+  if (window.crypto && typeof window.crypto.randomUUID === "function") {
+    return window.crypto.randomUUID();
+  }
+  return "session_" + Date.now() + "_" + Math.random().toString(36).slice(2, 10);
+}
 
 function log(msg) {
   console.log(msg);
@@ -48,6 +59,128 @@ function setStatus(text) {
       statusIndicator.classList.add("error");
     }
   }
+}
+
+function cancelRealtimeResponse() {
+  if (!dc || dc.readyState !== "open") return false;
+  try {
+    if (activeResponseIds.size > 0) {
+      activeResponseIds.forEach((responseId) => {
+        dc.send(JSON.stringify({ type: "response.cancel", response_id: responseId }));
+      });
+    } else {
+      dc.send(JSON.stringify({ type: "response.cancel" }));
+    }
+    activeResponseIds.clear();
+    return true;
+  } catch (err) {
+    log("⚠️ Failed to cancel realtime response: " + err);
+    return false;
+  }
+}
+
+function speakBackendAnswer(answer) {
+  if (!dc || dc.readyState !== "open" || !answer) return false;
+  const evt = {
+    type: "response.create",
+    response: {
+      metadata: { topic: "backend_policy_gate" },
+      modalities: ["audio", "text"],
+      instructions:
+        "Speak exactly the following text, verbatim, with no extra words:\n" + answer,
+    },
+  };
+  try {
+    dc.send(JSON.stringify(evt));
+    return true;
+  } catch (err) {
+    log("⚠️ Failed to speak backend answer via realtime model: " + err);
+    return false;
+  }
+}
+
+function stopRemoteAudioPlayback() {
+  try {
+    remoteAudio.pause();
+  } catch (e) {
+    // no-op
+  }
+}
+
+async function sendTelemetryEvent(payload) {
+  try {
+    await fetch("/telemetry", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload),
+    });
+  } catch (err) {
+    log("⚠️ Failed to send telemetry: " + err);
+  }
+}
+
+async function processRealtimeTranscript(transcript, sttConfidence, transcriptEventType) {
+  if (!transcript || !currentSessionId) return;
+  const started = performance.now();
+  let backend = null;
+  try {
+    const resp = await fetch("/chat_text", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        session_id: currentSessionId,
+        transcript,
+        stt_confidence: sttConfidence ?? null,
+      }),
+    });
+    backend = await resp.json();
+    if (!resp.ok) {
+      log("❌ /chat_text failed: " + JSON.stringify(backend));
+      return;
+    }
+  } catch (err) {
+    log("❌ Failed calling /chat_text: " + err);
+    return;
+  }
+
+  const canceled = cancelRealtimeResponse();
+  if (!canceled) {
+    stopRemoteAudioPlayback();
+  }
+
+  const answer = backend.answer || "";
+  log("🤖 Tutor: " + answer);
+
+  if (backend.mode === "refusal") {
+    const spoke = speakBackendAnswer(answer);
+    if (!spoke) stopRemoteAudioPlayback();
+  } else if (backend.mode === "text_only") {
+    speakBackendAnswer(answer);
+  } else {
+    speakBackendAnswer(answer);
+  }
+
+  const endToEndMs = backend?.latency_ms?.end_to_end ?? Math.round(performance.now() - started);
+  await sendTelemetryEvent({
+    session_id: currentSessionId,
+    event: "realtime_turn",
+    turn_id: backend.turn_id || 0,
+    latency_ms: {
+      stt: sttConfidence == null ? null : 0,
+      llm: backend?.latency_ms?.llm ?? null,
+      tts: backend?.latency_ms?.tts ?? null,
+      end_to_end: endToEndMs,
+    },
+    safety: backend.safety || { level: "low", categories: [] },
+    pii: backend.pii || { detected: false, redacted: false },
+    mode: backend.mode || "normal",
+    notes: {
+      response_id: backend.request_id || null,
+      extra: {
+        transcript_event_type: transcriptEventType,
+      },
+    },
+  });
 }
 
 function getTargetLanguage() {
@@ -209,6 +342,8 @@ function stopSession() {
   pc = null;
   dc = null;
   localStream = null;
+  currentSessionId = null;
+  handledTranscriptEvents.clear();
 
   stopBtn.disabled = true;
   startBtn.disabled = false;
@@ -229,6 +364,8 @@ async function startRealtimeSession() {
     throw new Error("Failed to get client secret: " + JSON.stringify(tokenData));
   }
   clientSecret = tokenData.client_secret;
+  realtimeModel = tokenData.realtime_model || "gpt-realtime";
+  currentSessionId = generateSessionId();
   log("✅ Got ephemeral client secret (hidden).");
 
   // 1) Get mic
@@ -302,6 +439,14 @@ async function startRealtimeSession() {
   const sessionConfig = {
     type: "realtime",
     instructions,
+    audio: {
+      input: {
+        turn_detection: {
+          type: "server_vad",
+          create_response: false,
+        },
+      },
+    },
   };
 
   // 8) Send SDP + session config to Realtime Calls API
@@ -310,7 +455,7 @@ async function startRealtimeSession() {
   fd.set("session", JSON.stringify(sessionConfig));
 
   const resp = await fetch(
-    "https://api.openai.com/v1/realtime/calls?model=gpt-realtime",
+    "https://api.openai.com/v1/realtime/calls?model=" + encodeURIComponent(realtimeModel),
     {
       method: "POST",
       headers: {
@@ -376,6 +521,14 @@ function sendSessionUpdate() {
     session: {
       type: "realtime",
       instructions,
+      audio: {
+        input: {
+          turn_detection: {
+            type: "server_vad",
+            create_response: false,
+          },
+        },
+      },
     },
   };
 
@@ -631,6 +784,27 @@ function handleServerEvent(msg) {
       log("👂 Detected user speech stop (after " + (SPEECH_STOP_DELAY_MS / 1000) + "s silence).");
       speechStopTimeout = null;
     }, SPEECH_STOP_DELAY_MS);
+  } else if (
+    msg.type === "conversation.item.input_audio_transcription.completed" ||
+    msg.type === "input_audio_buffer.transcription.completed"
+  ) {
+    const transcript =
+      msg.transcript ||
+      msg.text ||
+      (msg.item && msg.item.transcript) ||
+      (msg.item && msg.item.content && msg.item.content[0] && msg.item.content[0].text) ||
+      "";
+    const sttConfidence =
+      msg.confidence ||
+      (msg.item && msg.item.confidence) ||
+      null;
+    const eventKey = msg.item_id || msg.event_id || `${msg.type}:${transcript}`;
+    if (transcript && !handledTranscriptEvents.has(eventKey)) {
+      handledTranscriptEvents.add(eventKey);
+      transcriptPipeline = transcriptPipeline.then(() =>
+        processRealtimeTranscript(transcript, sttConfidence, msg.type)
+      );
+    }
   } else if (msg.type === "session.updated") {
     // Session updated (no need to log)
   } else if (msg.type === "error") {
