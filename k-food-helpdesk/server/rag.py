@@ -1,5 +1,6 @@
+import json
 import os, psycopg2
-from typing import List, Tuple, Optional
+from typing import Any, Dict, List, Optional
 from dotenv import load_dotenv
 from openai import OpenAI
 import math
@@ -30,12 +31,12 @@ def _cosine_similarity(vec1: List[float], vec2: List[float]) -> float:
         return 0.0
     return dot_product / (magnitude1 * magnitude2)
 
-def top_k(query:str, k:int=4, session_id:Optional[str]=None)->List[Tuple[str,str]]:
+def top_k(query: str, k: int = 4, session_id: Optional[str] = None) -> List[Dict[str, Any]]:
     """
     Retrieve top k documents for a query, with session-aware caching.
     Reuses previous results if cosine similarity > 0.9 with a cached query.
     """
-    qvec=_embed(query)
+    qvec = _embed(query)
     
     # Check cache if session_id is provided
     if session_id and session_id in _retrieval_cache:
@@ -49,8 +50,36 @@ def top_k(query:str, k:int=4, session_id:Optional[str]=None)->List[Tuple[str,str
     with _conn() as con, con.cursor() as cur:
         # Format vector as PostgreSQL array string for pgvector
         vec_str = "[" + ",".join(str(x) for x in qvec) + "]"
-        cur.execute("SELECT content, source FROM docs ORDER BY embedding <-> %s::vector LIMIT %s", (vec_str, k))
-        results = [(c,s) for (c,s) in cur.fetchall()]
+        cur.execute(
+            """
+            SELECT id, source, content, meta, (embedding <-> %s::vector) AS distance
+            FROM docs
+            ORDER BY distance ASC
+            LIMIT %s
+            """,
+            (vec_str, k),
+        )
+        rows = cur.fetchall()
+        results: List[Dict[str, Any]] = []
+        for doc_id, source, content, meta, distance in rows:
+            parsed_meta = meta
+            if isinstance(parsed_meta, str):
+                try:
+                    parsed_meta = json.loads(parsed_meta)
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    parsed_meta = {}
+            if not isinstance(parsed_meta, dict):
+                parsed_meta = {}
+            chunk = parsed_meta.get("chunk")
+            results.append(
+                {
+                    "doc_id": int(doc_id),
+                    "source": source or "",
+                    "content": content or "",
+                    "score": float(1.0 / (1.0 + float(distance))),
+                    "chunk": int(chunk) if isinstance(chunk, int) else None,
+                }
+            )
     
     # Cache the results if session_id is provided
     if session_id:

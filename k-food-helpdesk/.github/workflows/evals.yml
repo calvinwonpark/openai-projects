@@ -1,0 +1,61 @@
+name: k-food-helpdesk-evals
+
+on:
+  pull_request:
+    paths:
+      - "k-food-helpdesk/**"
+  push:
+    branches: [main]
+    paths:
+      - "k-food-helpdesk/**"
+
+jobs:
+  evals:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: k-food-helpdesk
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Create .env
+        run: |
+          cat > .env <<EOF
+          OPENAI_API_KEY=${{ secrets.OPENAI_API_KEY }}
+          PGHOST=db
+          PGPORT=5432
+          PGDATABASE=helpdesk
+          PGUSER=postgres
+          PGPASSWORD=postgres
+          MODEL_NAME=gpt-4o-mini
+          EOF
+
+      - name: Start services
+        run: docker compose up -d --build db server
+
+      - name: Index documents
+        run: docker compose run --rm indexer
+
+      - name: Wait for server
+        run: |
+          for i in {1..60}; do
+            if curl -fsS http://localhost:8010/health > /dev/null; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "Server not healthy in time" >&2
+          exit 1
+
+      - name: Run evals
+        run: API_BASE_URL=http://localhost:8010 python evals/run.py
+
+      - name: Dump logs on failure
+        if: failure()
+        run: docker compose logs --no-color

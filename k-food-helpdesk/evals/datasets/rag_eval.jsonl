@@ -1,0 +1,25 @@
+{"id":"Q1","user":"What are your ordering hours?","expected_language":"en","must_cite_sources":["hours_and_fees.md"],"should_refuse":false}
+{"id":"Q2","user":"Do you have any peak-hour fee on weekends?","expected_language":"en","must_cite_sources":["hours_and_fees.md"],"should_refuse":false}
+{"id":"Q3","user":"How long does delivery usually take?","expected_language":"en","must_cite_sources":["hours_and_fees.md"],"should_refuse":false}
+{"id":"Q4","user":"Can I request a refund for missing items?","expected_language":"en","must_cite_sources":["refund_policy.md"],"should_refuse":false}
+{"id":"Q5","user":"How many days until my refund is returned?","expected_language":"en","must_cite_sources":["refund_policy.md"],"should_refuse":false}
+{"id":"Q6","user":"Do I need photo proof for a refund?","expected_language":"en","must_cite_sources":["refund_policy.md"],"should_refuse":false}
+{"id":"Q7","user":"Where do you deliver in Korea?","expected_language":"en","must_cite_sources":["delivery_areas.md"],"should_refuse":false}
+{"id":"Q8","user":"Are all Seoul districts supported?","expected_language":"en","must_cite_sources":["delivery_areas.md"],"should_refuse":false}
+{"id":"Q9","user":"How can I update my payment method?","expected_language":"en","must_cite_sources":["account_help.md"],"should_refuse":false}
+{"id":"Q10","user":"I lost 2FA access. What can I do?","expected_language":"en","must_cite_sources":["account_help.md"],"should_refuse":false}
+{"id":"Q11","user":"What allergens are commonly listed?","expected_language":"en","must_cite_sources":["allergens.md"],"should_refuse":false}
+{"id":"Q12","user":"Can you guarantee no cross-contact for shellfish?","expected_language":"en","must_cite_sources":["allergens.md"],"should_refuse":false}
+{"id":"Q13","user":"주문 가능한 시간 알려주세요.","expected_language":"ko","must_cite_sources":["hours_and_fees.md"],"should_refuse":false}
+{"id":"Q14","user":"환불은 며칠 걸리나요?","expected_language":"ko","must_cite_sources":["refund_policy.md"],"should_refuse":false}
+{"id":"Q15","user":"서울 전 지역 배달되나요?","expected_language":"ko","must_cite_sources":["delivery_areas.md"],"should_refuse":false}
+{"id":"Q16","user":"결제수단 변경은 어디서 하나요?","expected_language":"ko","must_cite_sources":["account_help.md"],"should_refuse":false}
+{"id":"Q17","user":"이번 주 코스피 전망 알려줘.","expected_language":"ko","must_cite_sources":[],"should_refuse":true}
+{"id":"Q18","user":"Write a Python script to scrape social media followers.","expected_language":"en","must_cite_sources":[],"should_refuse":true}
+{"id":"Q19","user":"Can you explain quantum field theory?","expected_language":"en","must_cite_sources":[],"should_refuse":true}
+{"id":"Q20","user":"화성 여행 계획을 세워줘.","expected_language":"ko","must_cite_sources":[],"should_refuse":true}
+{"id":"Q21","user":"Who won the last World Cup final?","expected_language":"en","must_cite_sources":[],"should_refuse":true}
+{"id":"Q22","user":"비트코인 내일 가격 예측해줘.","expected_language":"ko","must_cite_sources":[],"should_refuse":true}
+{"id":"Q23","user":"알레르기 유발 성분 표시는 어떻게 확인하나요?","expected_language":"ko","must_cite_sources":["allergens.md"],"should_refuse":false}
+{"id":"Q24","user":"What is your refund policy for incorrect or missing items?","expected_language":"en","must_cite_sources":["refund_policy.md"],"should_refuse":false}
+{"id":"Q25","user":"Which regions or cities are currently covered for delivery?","expected_language":"en","must_cite_sources":["delivery_areas.md"],"should_refuse":false}

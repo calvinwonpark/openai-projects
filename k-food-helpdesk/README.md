@@ -8,7 +8,7 @@ The project consists of four main components:
 
 - **Database (PostgreSQL + pgvector)**: Stores document embeddings and metadata for semantic search
 - **Indexer**: Ingests policy documents and restaurant data, generates embeddings, and stores them in the database
-- **Server (FastAPI)**: Provides REST API endpoints for chat and search functionality using OpenAI embeddings and GPT-4
+- **Server (FastAPI)**: Provides safe-RAG API endpoints with structured outputs, citations, PII redaction, and trace logging
 - **Web (Next.js)**: React-based frontend for user interaction
 
 ## Prerequisites
@@ -61,22 +61,59 @@ Once all services are running:
 
 - `GET /health` - Health check endpoint
 
-- `POST /chat` - Chat with the AI assistant
+- `POST /chat` - Safe-RAG chat endpoint (strict structured response)
   ```json
   {
     "message": "What is your refund policy?",
     "session_id": "optional-session-id"
   }
   ```
-  The frontend automatically generates and sends a `session_id` for caching purposes. If provided, similar queries within the same session will reuse cached retrieval results.
+  Response shape:
+  ```json
+  {
+    "request_id": "uuid",
+    "answer": "string",
+    "language": "ko",
+    "confidence": 0.93,
+    "citations": [
+      {
+        "doc_id": 12,
+        "source": "refund_policy.md",
+        "chunk": 0,
+        "quote": "We accept refund requests within 24 hours..."
+      }
+    ],
+    "refusal": { "is_refusal": false, "reason": null },
+    "pii": { "detected": false, "redacted": false },
+    "retrieval_trace": {
+      "k": 4,
+      "results": [
+        { "doc_id": 12, "source": "refund_policy.md", "score": 0.89, "chunk": 0 }
+      ]
+    },
+    "usage": {
+      "model": "gpt-4o-mini",
+      "input_tokens": 312,
+      "output_tokens": 142,
+      "latency_ms": 1280
+    }
+  }
+  ```
+  Notes:
+  - Questions outside available references should return `refusal.is_refusal=true` with reason `INSUFFICIENT_CONTEXT`.
+  - Input text is redacted for supported PII patterns (email/phone) before retrieval and generation.
+  - Citations are strictly validated server-side: each `citation.quote` must match the cited retrieved chunk content.
+  - For non-refusal answers, citation count must cover answer paragraphs (`max(1, min(paragraph_count, 3))`), otherwise the server falls back to refusal.
+  - `session_id` is optional; if provided, retrieval cache is session-aware.
   
-- `POST /search` - Search for relevant documents (for testing RAG)
+- `POST /search` - Structured retrieval output (for RAG debugging/testing)
   ```json
   {
     "message": "delivery areas",
     "session_id": "optional-session-id"
   }
   ```
+  Response includes `doc_id`, `source`, `content`, `score`, and `chunk`.
 
 - `GET /metrics` - Returns performance metrics
   Returns metrics about API usage and performance:
@@ -96,6 +133,10 @@ Once all services are running:
   - Token usage (input, output, and total)
   - Average tokens per request
   - 95th percentile latency (in seconds and milliseconds)
+
+- `GET /debug/trace/{request_id}` - Returns per-request debug trace
+  - Includes retrieval trace and response metadata
+  - Stores only redacted user text (not raw user input)
 
 ## Project Structure
 
@@ -118,9 +159,18 @@ k-food-helpdesk/
 ├── server/
 │   ├── Dockerfile
 │   ├── main.py             # FastAPI application
+│   ├── pii.py              # Lightweight PII detect/redact hooks
 │   ├── rag.py              # RAG retrieval logic
 │   ├── prompts.py          # System prompts
 │   └── requirements.txt
+├── evals/
+│   ├── README.md
+│   ├── run.py              # Offline eval runner for /chat contract
+│   └── datasets/
+│       └── rag_eval.jsonl  # Eval dataset (positive + refusal cases)
+├── .github/
+│   └── workflows/
+│       └── evals.yml       # CI gate for offline evals
 ├── web/
 │   ├── Dockerfile
 │   ├── app/
@@ -134,10 +184,17 @@ k-food-helpdesk/
 ## Features
 
 - **Bilingual Support**: Automatically detects and responds in Korean or English
-- **Semantic Search**: Uses vector embeddings for contextually relevant document retrieval
+- **Strict Structured Output**: `/chat` always returns a typed JSON payload with confidence, citations, refusal, and usage fields
+- **Strict Verifiable Citations**: Citations are accepted only when `quote` is present verbatim in the retrieved `(doc_id, source, chunk)` content
+- **Grounded Safe-RAG**: The model is instructed to use only retrieved REFERENCE snippets and refuse when context is insufficient
+- **Prompt-Injection Resistance**: Retrieved snippets are treated as untrusted REFERENCE data
+- **PII Redaction Hook**: Email/phone patterns are redacted before embedding and generation
+- **Structured Retrieval Trace**: Retrieval outputs include `doc_id`, `source`, `score`, and `chunk`
 - **Session-Aware Caching**: Reuses retrieval results for similar queries (cosine similarity > 0.9) within the same session, reducing API calls and improving response time
+- **Per-Request Observability**: JSON request logs and trace lookup endpoint by `request_id`
+- **Offline Eval Suite + CI Gate**: Local eval script and GitHub Action workflow for gating changes
+- **Expanded Eval Coverage**: `evals/datasets/rag_eval.jsonl` includes 25 checks across positive and refusal scenarios, including Korean/English coverage and source-specific assertions
 - **Performance Metrics**: Built-in metrics endpoint tracking request counts, token usage, and p95 latency
-- **Source Citation**: Shows which documents were used to generate each response
 - **Restaurant Information**: Includes restaurant data (name, district, categories, hours, delivery areas, allergens)
 - **Policy Documents**: Supports multiple policy documents (refunds, delivery, allergens, account help, hours & fees)
 
@@ -148,6 +205,24 @@ k-food-helpdesk/
 To rebuild a specific service after code changes:
 ```bash
 docker compose up -d --build <service-name>
+```
+
+### Running Offline Evals
+
+```bash
+# Start API + DB
+docker compose up -d --build db server
+
+# Ensure docs are indexed
+docker compose run --rm indexer
+
+# Run eval suite (fails non-zero on contract violations)
+API_BASE_URL=http://localhost:8010 python evals/run.py
+```
+
+If your API is exposed on a different host/port:
+```bash
+API_BASE_URL=http://localhost:8000 python evals/run.py
 ```
 
 ### Viewing Logs
@@ -184,7 +259,7 @@ docker compose down -v
 - **Backend**: FastAPI, Python 3.11
 - **Frontend**: Next.js 14, React 18
 - **Database**: PostgreSQL with pgvector extension
-- **AI/ML**: OpenAI API (embeddings: `text-embedding-3-small`, chat: `gpt-4-turbo`)
+- **AI/ML**: OpenAI API (embeddings: `text-embedding-3-small`, chat model: env `MODEL_NAME`, default `gpt-4o-mini`)
 - **Containerization**: Docker, Docker Compose
 
 ## Environment Variables
@@ -199,11 +274,17 @@ When setting up the project:
 2. Fill in your actual values (especially `OPENAI_API_KEY`)
 3. The `.env` file will persist locally and won't be pushed to git
 
+Common server vars:
+- `OPENAI_API_KEY` (required)
+- `MODEL_NAME` (optional, default: `gpt-4o-mini`)
+- `CHAT_TEMPERATURE` (optional, default: `0.1`)
+
 ## Notes
 
 - The database uses pgvector for efficient similarity search on embeddings
 - Documents are chunked (800 chars for policies, 600 chars for restaurants) for better retrieval
 - The system uses cosine distance (`<->`) for vector similarity search
+- Retrieval metadata parsing handles both JSON objects and JSON-encoded strings in `meta` to preserve `chunk` reliably
 - CORS is configured to allow requests from `localhost:3001` and `localhost:3000`
 
 ### Session-Aware Retrieval Caching
@@ -232,3 +313,11 @@ Access metrics at `GET /metrics` to monitor API usage, token consumption, and re
 - Performance optimization (identifying slow requests via p95 latency)
 - Capacity planning (understanding request patterns)
 
+### CI Eval Gate
+
+The repository includes `.github/workflows/evals.yml` for `k-food-helpdesk`.
+On pull requests and pushes to `main`, it:
+- Starts the compose services
+- Runs ingestion
+- Executes `python evals/run.py`
+- Fails the workflow if eval checks fail

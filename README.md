@@ -15,9 +15,9 @@ Migrated the full system to the new Responses API using function calling and cus
 **OpenAI APIs Used:** Responses API, Chat Completions API, Embeddings API (for custom vector search), Function Calling, Containers API (for file retrieval)
 
 ### K-Food Helpdesk (RAG)
-Built a bilingual semantic search helpdesk using pgvector, embeddings, and a FastAPI + Next.js architecture with session-aware caching. Provides accurate, context-aware responses about policies, restaurants, delivery areas, and allergens with automatic Korean/English language detection.
+Enterprise-style safe RAG pilot template for an AI deployment interview setting. Uses pgvector + FastAPI + Next.js with strict JSON outputs, verifiable citations, prompt-injection-resistant context handling, PII redaction hooks, per-request traceability, and offline eval + CI gating.
 
-**OpenAI APIs Used:** Embeddings API (text-embedding-3-small), Chat Completions API (GPT-4 Turbo)
+**OpenAI APIs Used:** Embeddings API (`text-embedding-3-small`), Chat Completions API (configurable via `MODEL_NAME`, default `gpt-4o-mini`)
 
 ### GIR Caddie (Multimodal)
 Created a GPT-4o Vision golf strategy assistant that parses course images, detects hazards, and generates LLM-based shot plans. Analyzes scorecards, hole layouts, and player profiles to maximize Green In Regulation (GIR) probability with strategic club recommendations.
